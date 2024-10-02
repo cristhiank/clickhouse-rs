@@ -17,7 +17,7 @@ use crate::{
     errors::{Error, FromSqlError, Result},
     types::{
         column::{self, ArcColumnWrapper, Column, ColumnFrom},
-        ColumnType, Complex, FromSql, Simple, SqlType,
+        ColumnType, Complex, FromSql, Simple,
     },
 };
 
@@ -42,6 +42,7 @@ pub trait ColumnIdx {
     fn get_index<K: ColumnType>(&self, columns: &[Column<K>]) -> Result<usize>;
 }
 
+/*
 pub trait Sliceable {
     fn slice_type() -> SqlType;
 }
@@ -71,6 +72,8 @@ sliceable! {
     i64: Int64,
     i128: Int128
 }
+
+*/
 
 /// Represents Clickhouse Block
 #[derive(Default)]

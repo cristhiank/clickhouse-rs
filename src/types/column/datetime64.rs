@@ -156,6 +156,7 @@ pub(crate) fn to_native_datetime_opt(value: i64, precision: u32) -> Option<Naive
     let sec = nano / 1_000_000_000;
     let nsec = nano - sec * 1_000_000_000;
 
+    #[allow(deprecated)]
     NaiveDateTime::from_timestamp_opt(sec, nsec as u32)
 }
 

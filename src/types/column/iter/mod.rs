@@ -470,6 +470,7 @@ impl<'a> DateIterator<'a> {
 
 impl<'a> NativeDateTimeIterator<'a> {
     #[inline(always)]
+    #[allow(deprecated)]
     unsafe fn get_by_index(&self, index: usize) -> NaiveDateTime {
         let index_ = self
             .lc_index
