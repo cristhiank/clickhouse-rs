@@ -12,7 +12,7 @@ use std::{
 };
 
 use chrono_tz::Tz;
-use log::trace;
+use log::{error, info, trace};
 
 use pin_project::pin_project;
 
@@ -175,6 +175,7 @@ impl<'p> ClickhouseTransportProj<'p> {
                     if e.is_would_block() {
                         Poll::Pending
                     } else {
+                        error!("[ClickhouseTransportProj] Error parsing packet: {:?}", e);
                         Poll::Ready(Some(Err(e.into())))
                     }
                 }
@@ -277,6 +278,7 @@ impl Stream for ClickhouseTransport {
         while !*this.done {
             match read_to_end(this.inner.as_mut(), cx, this.rd) {
                 Poll::Ready(Ok(0)) => {
+                    info!("[ClickhouseTransport] Stream received done signal");
                     *this.done = true;
                     break;
                 }
@@ -287,6 +289,7 @@ impl Stream for ClickhouseTransport {
         }
 
         if *this.done {
+            info!("[ClickhouseTransport] Closing stream");
             return Poll::Ready(None);
         }
 
@@ -359,7 +362,10 @@ impl Stream for PacketStream {
 
                                 return Poll::Ready(Some(Err(e)));
                             }
-                            Poll::Ready(None) => return Poll::Ready(None),
+                            Poll::Ready(None) => {
+                                info!("[PacketStream] Handling None result from transport");
+                                return Poll::Ready(None);
+                            }
                             Poll::Pending => return Poll::Pending,
                         },
                     };
@@ -376,7 +382,10 @@ impl Stream for PacketStream {
                 PacketStreamState::Done => {
                     return match self.inner.take() {
                         Some(inner) => Poll::Ready(Some(Ok(Packet::Eof(inner)))),
-                        _ => Poll::Ready(None),
+                        _ => {
+                            error!("[PacketStream] Transport is None");
+                            Poll::Ready(None)
+                        }
                     };
                 }
             };

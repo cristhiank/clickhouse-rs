@@ -7,6 +7,7 @@ use std::{
 
 use futures_core::Stream;
 use futures_util::StreamExt;
+use log::{error, info};
 
 use crate::{
     errors::{DriverError, Error, Result},
@@ -77,7 +78,11 @@ impl<'a> Stream for BlockStream<'a> {
         loop {
             match self.state {
                 BlockStreamState::Reading => {}
-                BlockStreamState::Finished => return Poll::Ready(None),
+                BlockStreamState::Finished => {
+                    info!("[BlockStream] Stream is finished");
+
+                    return Poll::Ready(None)
+                },
                 BlockStreamState::Error => {
                     return Poll::Ready(Some(Err(Error::Other(Cow::Borrowed(
                         "Attempt to read from broken transport",
@@ -104,10 +109,14 @@ impl<'a> Stream for BlockStream<'a> {
                         self.client.pool.attach();
                     }
                     self.state = BlockStreamState::Finished;
+
+                    info!("[BlockStream] Received EOF packet");
                 }
                 Packet::ProfileInfo(_) | Packet::Progress(_) => {}
                 Packet::Exception(exception) => {
                     self.state = BlockStreamState::Finished;
+
+                    error!("[BlockStream] Received exception packet: {:?}", exception);
                     return Poll::Ready(Some(Err(Error::Server(exception))));
                 }
                 Packet::Block(block) => {
