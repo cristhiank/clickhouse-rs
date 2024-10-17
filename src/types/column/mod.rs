@@ -28,8 +28,8 @@ use crate::{
 };
 
 use self::chunk::ChunkColumnData;
-pub(crate) use self::string_pool::StringPool;
 pub use self::column_data::ColumnData;
+pub(crate) use self::string_pool::StringPool;
 pub use self::{concat::ConcatColumnData, numeric::VectorColumnData};
 
 mod array;
