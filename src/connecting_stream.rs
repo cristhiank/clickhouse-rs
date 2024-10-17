@@ -269,11 +269,7 @@ impl ConnectingStream {
                         .with_no_client_auth()
                 } else {
                     let mut cert_store = RootCertStore::empty();
-                    cert_store.extend(
-                        webpki_roots::TLS_SERVER_ROOTS
-                            .iter()
-                            .cloned()
-                    );
+                    cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                     if let Some(certificates) = options.certificate.clone() {
                         for certificate in
                             Into::<Vec<rustls::pki_types::CertificateDer<'static>>>::into(
@@ -281,14 +277,16 @@ impl ConnectingStream {
                             )
                         {
                             match cert_store.add(certificate) {
-                                Ok(_) => {},
+                                Ok(_) => {}
                                 Err(err) => {
                                     let err = io::Error::new(
                                         io::ErrorKind::InvalidInput,
                                         format!("Could not load certificate: {}.", err),
                                     );
-                                    return Self { state: State::tcp_err(err) };
-                                },
+                                    return Self {
+                                        state: State::tcp_err(err),
+                                    };
+                                }
                             }
                         }
                     }

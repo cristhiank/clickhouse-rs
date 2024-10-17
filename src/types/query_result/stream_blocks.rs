@@ -18,6 +18,7 @@ use crate::{
 
 pub(crate) struct BlockStream<'a> {
     client: &'a mut ClientHandle,
+    name: String,
     inner: PacketStream,
     state: BlockStreamState,
     block_index: usize,
@@ -58,11 +59,13 @@ impl<'a> Drop for BlockStream<'a> {
 impl<'a> BlockStream<'a> {
     pub(crate) fn new(
         client: &mut ClientHandle,
+        name: String,
         inner: PacketStream,
         skip_first_block: bool,
     ) -> BlockStream {
         BlockStream {
             client,
+            name,
             inner,
             state: BlockStreamState::Reading,
             block_index: 0,
@@ -79,14 +82,19 @@ impl<'a> Stream for BlockStream<'a> {
             match self.state {
                 BlockStreamState::Reading => {}
                 BlockStreamState::Finished => {
-                    info!("[BlockStream] Stream is finished");
+                    info!(
+                        "{}: [BlockStream] Stream is finished after a block count of {}",
+                        self.name, self.block_index
+                    );
 
-                    return Poll::Ready(None)
-                },
+                    return Poll::Ready(None);
+                }
                 BlockStreamState::Error => {
-                    return Poll::Ready(Some(Err(Error::Other(Cow::Borrowed(
-                        "Attempt to read from broken transport",
-                    )))))
+                    let error_string = format!(
+                        "{}: Attempt to read from broken transport after a block count of {}",
+                        self.name, self.block_index
+                    );
+                    return Poll::Ready(Some(Err(Error::Other(Cow::Owned(error_string)))));
                 }
             };
 
@@ -110,13 +118,19 @@ impl<'a> Stream for BlockStream<'a> {
                     }
                     self.state = BlockStreamState::Finished;
 
-                    info!("[BlockStream] Received EOF packet");
+                    info!(
+                        "{}: [BlockStream] Received EOF packet (Block Count {})",
+                        self.name, self.block_index
+                    );
                 }
                 Packet::ProfileInfo(_) | Packet::Progress(_) => {}
                 Packet::Exception(exception) => {
                     self.state = BlockStreamState::Finished;
 
-                    error!("[BlockStream] Received exception packet: {:?}", exception);
+                    error!(
+                        "{}: [BlockStream] Received exception packet (Block Count {}): {:?}",
+                        self.name, self.block_index, exception
+                    );
                     return Poll::Ready(Some(Err(Error::Server(exception))));
                 }
                 Packet::Block(block) => {

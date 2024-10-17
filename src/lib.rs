@@ -110,7 +110,9 @@
 #![recursion_limit = "1024"]
 
 #[cfg(all(feature = "tls-native-tls", feature = "tls-rustls"))]
-compile_error!("tls-native-tls and tls-rustls are mutually exclusive and cannot be enabled together");
+compile_error!(
+    "tls-native-tls and tls-rustls are mutually exclusive and cannot be enabled together"
+);
 
 use std::{fmt, future::Future, time::Duration};
 
@@ -378,6 +380,21 @@ impl ClientHandle {
         QueryResult {
             client: self,
             query,
+            name: "".to_string(),
+        }
+    }
+
+    /// Executes Clickhouse `query` on Conn. The `name` is used to identify the query.
+    /// Name will help debugging and logging.
+    pub fn named_query<Q>(&mut self, sql: Q, name: String) -> QueryResult
+    where
+        Query: From<Q>,
+    {
+        let query = Query::from(sql);
+        QueryResult {
+            client: self,
+            query,
+            name,
         }
     }
 

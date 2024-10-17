@@ -22,6 +22,7 @@ pub(crate) mod stream_blocks;
 pub struct QueryResult<'a> {
     pub(crate) client: &'a mut ClientHandle,
     pub(crate) query: Query,
+    pub(crate) name: String,
 }
 
 impl<'a> QueryResult<'a> {
@@ -92,7 +93,12 @@ impl<'a> QueryResult<'a> {
 
                 let inner = c.get_inner()?.call(Cmd::SendQuery(query, context));
 
-                Ok(BlockStream::<'a>::new(c, inner, skip_first_block))
+                Ok(BlockStream::<'a>::new(
+                    c,
+                    self.name.clone(),
+                    inner,
+                    skip_first_block,
+                ))
             })
     }
 
