@@ -383,7 +383,7 @@ impl Stream for PacketStream {
                     return match self.inner.take() {
                         Some(inner) => Poll::Ready(Some(Ok(Packet::Eof(inner)))),
                         _ => {
-                            error!("[PacketStream] Transport is None");
+                            info!("[PacketStream] Transport is None");
                             Poll::Ready(None)
                         }
                     };

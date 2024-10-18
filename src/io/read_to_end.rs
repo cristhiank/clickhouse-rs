@@ -43,10 +43,19 @@ pub(crate) fn read_to_end(
 
         match ready!(rd.as_mut().poll_read(cx, &mut g.buf[g.len..])) {
             Ok(0) => {
+                let filled_len = g.len - start_len;
+
+                log::info!(
+                    "0 byte read from stream {:?}. Total read: {}",
+                    rd.debug_print(),
+                    filled_len
+                );
                 ret = Poll::Ready(Ok(g.len - start_len));
                 break;
             }
-            Ok(n) => g.len += n,
+            Ok(n) => {
+                g.len += n;
+            }
             Err(e) => {
                 ret = Poll::Ready(Err(e));
                 break;

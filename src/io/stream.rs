@@ -93,6 +93,14 @@ impl Stream {
         }
     }
 
+    pub(crate) fn debug_print(&self) -> String {
+        match self {
+            Stream::Plain(ref stream) => format!("{:?}", stream),
+            #[cfg(feature = "_tls")]
+            Stream::Secure(ref stream) => format!("{:?}", stream),
+        }
+    }
+
     #[cfg(not(feature = "async_std"))]
     pub(crate) fn poll_read(
         self: Pin<&mut Self>,
