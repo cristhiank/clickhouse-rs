@@ -114,7 +114,7 @@ compile_error!(
     "tls-native-tls and tls-rustls are mutually exclusive and cannot be enabled together"
 );
 
-use std::{fmt, future::Future, time::Duration};
+use std::{fmt, future::Future, io::ErrorKind, time::Duration};
 
 use futures_util::{
     future, future::BoxFuture, future::FutureExt, stream, stream::BoxStream, StreamExt,
@@ -341,10 +341,14 @@ impl ClientHandle {
         self.inner = h;
         if let Some(server_info) = info {
             self.context.server_info = server_info;
+            Ok(())
         } else {
             warn!("Server info is not received");
+            Err(Error::Io(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "Invalid hello packet. possibly due to a dropped connection.",
+            )))
         }
-        Ok(())
     }
 
     pub async fn ping(&mut self) -> Result<()> {
