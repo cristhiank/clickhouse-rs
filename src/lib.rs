@@ -114,7 +114,7 @@ compile_error!(
     "tls-native-tls and tls-rustls are mutually exclusive and cannot be enabled together"
 );
 
-use std::{fmt, future::Future, time::Duration};
+use std::{fmt, future::Future, io::ErrorKind, time::Duration};
 
 use futures_util::{
     future, future::BoxFuture, future::FutureExt, stream, stream::BoxStream, StreamExt,
@@ -323,15 +323,32 @@ impl ClientHandle {
                     h = Some(inner);
                     info = Some(server_info);
                 }
-                Ok(Packet::Exception(e)) => return Err(Error::Server(e)),
-                Err(e) => return Err(Error::Io(e)),
-                _ => return Err(Error::Driver(DriverError::UnexpectedPacket)),
+                Ok(Packet::Exception(e)) => {
+                    log::error!("[hello] <- Server error: {:?}", e);
+                    return Err(Error::Server(e));
+                }
+                Err(e) => {
+                    log::error!("[hello] <- IO error: {:?}", e);
+                    return Err(Error::Io(e));
+                }
+                p => {
+                    log::error!("[hello] <- Unexpected packet received: {:?}", p);
+                    return Err(Error::Driver(DriverError::UnexpectedPacket));
+                }
             }
         }
 
         self.inner = h;
-        self.context.server_info = info.unwrap();
-        Ok(())
+        if let Some(server_info) = info {
+            self.context.server_info = server_info;
+            Ok(())
+        } else {
+            warn!("Server info is not received");
+            Err(Error::Io(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "Invalid hello packet. possibly due to a dropped connection.",
+            )))
+        }
     }
 
     pub async fn ping(&mut self) -> Result<()> {
