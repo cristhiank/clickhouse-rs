@@ -81,7 +81,8 @@ fn encode_query(query: &Query, context: &Context) -> Result<Vec<u8>> {
     // DBMS_MIN_REVISION_WITH_CLIENT_INFO
     let mut encoder = Encoder::new();
     encoder.uvarint(protocol::CLIENT_QUERY);
-    encoder.string("");
+
+    encoder.string(query.get_id());
 
     {
         let hostname = &context.hostname;
