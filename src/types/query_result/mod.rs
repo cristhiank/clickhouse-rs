@@ -33,7 +33,7 @@ impl<'a> QueryResult<'a> {
         with_timeout(
             async {
                 let blocks = self
-                    .stream_blocks_(false)
+                    .stream_all_blocks(false)
                     .try_fold(Vec::new(), |mut blocks, block| {
                         if !block.is_empty() {
                             blocks.push(block);
@@ -78,10 +78,18 @@ impl<'a> QueryResult<'a> {
     /// # ret.unwrap()
     /// ```
     pub fn stream_blocks(self) -> BoxStream<'a, Result<Block>> {
-        self.stream_blocks_(true)
+        self.stream_all_blocks(true)
     }
 
-    fn stream_blocks_(self, skip_first_block: bool) -> BoxStream<'a, Result<Block>> {
+    /// By convention, ClickHouse returns the first block as a header block. This method
+    /// allows you to skip the first block and start streaming from the second block.
+    ///
+    /// Not skipping the first block may be useful in some cases, such as when you want to
+    /// get the column names and types.
+    ///
+    /// Refer to the following link for more details:
+    /// https://github.com/ClickHouse/ClickHouse/blob/849cf0b2f4d57415603bd686153e026a2f8466c5/src/Core/Protocol.h#L51
+    pub fn stream_all_blocks(self, skip_first_block: bool) -> BoxStream<'a, Result<Block>> {
         let query = self.query.clone();
 
         self.client
