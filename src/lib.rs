@@ -114,7 +114,13 @@ compile_error!(
     "tls-native-tls and tls-rustls are mutually exclusive and cannot be enabled together"
 );
 
-use std::{fmt, future::Future, io::ErrorKind, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    io::ErrorKind,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use futures_util::{
     future, future::BoxFuture, future::FutureExt, stream, stream::BoxStream, StreamExt,
@@ -246,6 +252,7 @@ pub struct ClientHandle {
     inner: Option<ClickhouseTransport>,
     context: Context,
     pool: PoolBinding,
+    used: AtomicBool, // Whether the connection has been used at least once
 }
 
 impl fmt::Debug for ClientHandle {
@@ -296,6 +303,7 @@ impl Client {
                         None => PoolBinding::None,
                         Some(p) => PoolBinding::Detached(p),
                     },
+                    used: false.into(),
                 };
 
                 handle.hello().await?;
@@ -630,12 +638,20 @@ impl ClientHandle {
         Ok(())
     }
 
+    pub fn has_been_used(&self) -> bool {
+        self.used.load(Ordering::Acquire)
+    }
+
     pub(crate) fn set_inside(&self, value: bool) {
         if let Some(ref inner) = self.inner {
             inner.set_inside(value);
         } else {
             unreachable!()
         }
+    }
+
+    pub(crate) fn set_used(&self) {
+        self.used.store(true, Ordering::Release);
     }
 
     fn get_inner(&mut self) -> Result<ClickhouseTransport> {

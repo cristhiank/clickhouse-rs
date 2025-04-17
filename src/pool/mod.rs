@@ -1,16 +1,21 @@
 use std::{
-    fmt, mem,
+    fmt,
+    io::ErrorKind,
+    mem,
     pin::Pin,
-    sync::atomic::{self, Ordering},
-    sync::Arc,
+    sync::{
+        atomic::{self, Ordering},
+        Arc,
+    },
     task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 use futures_util::future::BoxFuture;
 use log::{error, warn};
 
 use crate::{
-    errors::Result,
+    errors::{Error, Result},
     types::{IntoOptions, OptionsSource},
     Client, ClientHandle,
 };
@@ -32,6 +37,10 @@ pub(crate) struct Inner {
 
 impl Inner {
     pub(crate) fn release_conn(&self) {
+        if self.ongoing.load(Ordering::Acquire) == 0 {
+            warn!("release_conn called when no connections are ongoing");
+            return;
+        }
         self.ongoing.fetch_sub(1, Ordering::AcqRel);
         while let Some(task) = self.tasks.pop() {
             task.wake()
@@ -217,7 +226,79 @@ impl Pool {
     fn new_connection(&self) -> BoxFuture<'static, Result<ClientHandle>> {
         let source = self.options.clone();
         let pool = Some(self.clone());
-        Box::pin(async move { Client::open(source, pool).await })
+
+        let (max_attempts, retry_timeout) = {
+            match source.get() {
+                Ok(opt) => (opt.send_retries, opt.retry_timeout),
+                Err(_) => (0usize, Duration::from_secs(0)),
+            }
+        };
+
+        Box::pin(async move { Self::retry_open(source, pool, max_attempts, retry_timeout).await })
+    }
+
+    async fn retry_open(
+        source: OptionsSource,
+        pool: Option<Pool>,
+        max_attempts: usize,
+        retry_timeout: Duration,
+    ) -> Result<ClientHandle> {
+        let mut attempt = 0;
+
+        loop {
+            let result = Client::open(source.clone(), pool.clone()).await;
+
+            match result {
+                Err(Error::Io(ref err)) => {
+                    if err.kind() == ErrorKind::BrokenPipe
+                        || err.kind() == ErrorKind::ConnectionRefused
+                    {
+                        if attempt >= max_attempts {
+                            error!(
+                                "Failed to connect to ClickHouse after {} attempts: {}",
+                                attempt, err
+                            );
+
+                            return result;
+                        }
+
+                        attempt += 1;
+
+                        warn!(
+                            "Failed to connect to ClickHouse: {}. Retrying {}/{}...",
+                            err, attempt, max_attempts
+                        );
+
+                        #[cfg(feature = "async_std")]
+                        {
+                            use async_std::task;
+                            task::sleep(retry_timeout).await;
+                        }
+
+                        #[cfg(not(feature = "async_std"))]
+                        {
+                            tokio::time::sleep(retry_timeout).await;
+                        }
+                    } else {
+                        error!(
+                            "Failed to connect to ClickHouse due to non-retriable IO error: {}",
+                            err
+                        );
+                    }
+                }
+                Err(_) => return result,
+                Ok(handle) => {
+                    if attempt > 0 {
+                        warn!(
+                            "Successfully connected to ClickHouse after {} retry attempts",
+                            attempt
+                        );
+                    }
+
+                    return Ok(handle);
+                }
+            }
+        }
     }
 
     fn handle_futures(&mut self, cx: &mut Context<'_>) -> Result<()> {
@@ -245,6 +326,7 @@ impl Pool {
         if let Some(mut client) = self.inner.idle.pop() {
             client.pool = PoolBinding::Attached(self.clone());
             client.set_inside(false);
+            client.set_used();
             self.inner.ongoing.fetch_add(1, Ordering::AcqRel);
             Some(client)
         } else {
@@ -262,6 +344,12 @@ impl Pool {
         if self.inner.idle.len() < min && is_attached && client.inner.is_some() {
             let _ = self.inner.idle.push(client);
         }
+
+        if self.inner.ongoing.load(Ordering::Acquire) == 0 {
+            warn!("return_conn called when no connections are ongoing");
+            return;
+        }
+
         self.inner.ongoing.fetch_sub(1, Ordering::AcqRel);
 
         while let Some(task) = self.inner.tasks.pop() {
@@ -283,12 +371,20 @@ impl Drop for ClientHandle {
                 return;
             }
 
+            if !self.has_been_used() {
+                // If the client was never taken from the pool, we don't need to return the connection
+                warn!("Dropping a client that was not used.");
+                return;
+            }
+
             let context = self.context.clone();
             let client = Self {
                 inner: Some(inner),
                 pool: pool.clone(),
                 context,
+                used: false.into(),
             };
+
             pool.return_conn(client);
         }
     }
