@@ -115,11 +115,11 @@ pub struct Pool {
 }
 
 #[derive(Debug)]
-struct PoolInfo {
-    new_len: usize,
-    idle_len: usize,
-    tasks_len: usize,
-    ongoing: usize,
+pub struct PoolInfo {
+    pub new_len: usize,
+    pub idle_len: usize,
+    pub tasks_len: usize,
+    pub ongoing: usize,
 }
 
 impl fmt::Debug for Pool {
@@ -184,7 +184,7 @@ impl Pool {
         }
     }
 
-    fn info(&self) -> PoolInfo {
+    pub fn info(&self) -> PoolInfo {
         PoolInfo {
             new_len: self.inner.new.len(),
             idle_len: self.inner.idle.len(),
