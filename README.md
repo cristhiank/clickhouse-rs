@@ -42,7 +42,7 @@ parameters:
     * `none`
     * `lz4`
 
-- `connection_timeout` - Timeout for connection (defaults to `500 ms`)
+- `connection_timeout` - Timeout for connection (defaults to `500 ms`). This default is tuned for low-latency LANs; increase it (e.g., to a few seconds) if you see `[timeout] operation=connect` warnings or run over TLS/slow networks.
 - `query_timeout` - Timeout for queries (defaults to `180 sec`).
 - `insert_timeout` - Timeout for inserts (defaults to `180 sec`).
 - `execute_timeout` - Timeout for execute (defaults to `180 sec`).

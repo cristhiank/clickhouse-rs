@@ -2,7 +2,11 @@ use std::{mem, time::Duration};
 
 use log::warn;
 
-use crate::{errors::Result, types::OptionsSource, Client, ClientHandle, Pool};
+use crate::{
+    errors::{DriverError, Error, Result},
+    types::OptionsSource,
+    Client, ClientHandle, Pool,
+};
 
 pub(crate) async fn retry_guard(
     handle: &mut ClientHandle,
@@ -21,6 +25,20 @@ pub(crate) async fn retry_guard(
             match check(handle).await {
                 Ok(()) => return Ok(()),
                 Err(err) => {
+                    if is_timeout(&err) {
+                        if attempt >= max_attempt {
+                            warn!(
+                                "[retry_guard] timeout during ping check; exhausted max attempts ({}).",
+                                max_attempt
+                            );
+                        } else {
+                            warn!(
+                                "[retry_guard] timeout during ping check; scheduling reconnect (attempt {}/{})",
+                                attempt + 1,
+                                max_attempt
+                            );
+                        }
+                    }
                     if attempt >= max_attempt {
                         return Err(err);
                     }
@@ -32,6 +50,21 @@ pub(crate) async fn retry_guard(
             Ok(()) => continue,
             Err(err) => {
                 skip_check = true;
+                if is_timeout(&err) {
+                    if attempt >= max_attempt {
+                        warn!(
+                            "[retry_guard] timeout during reconnect; exhausted max attempts ({}).",
+                            max_attempt
+                        );
+                    } else {
+                        warn!(
+                            "[retry_guard] timeout during reconnect; sleeping {:?} before retry (attempt {}/{})",
+                            duration,
+                            attempt + 1,
+                            max_attempt
+                        );
+                    }
+                }
                 if attempt >= max_attempt {
                     return Err(err);
                 }
@@ -51,6 +84,10 @@ pub(crate) async fn retry_guard(
 
         attempt += 1;
     }
+}
+
+fn is_timeout(err: &Error) -> bool {
+    matches!(err, Error::Driver(DriverError::Timeout))
 }
 
 async fn check(c: &mut ClientHandle) -> Result<()> {
