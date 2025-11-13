@@ -397,7 +397,7 @@ impl ClientHandle {
     }
 
     /// Executes Clickhouse `query` on Conn.
-    pub fn query<Q>(&mut self, sql: Q) -> QueryResult
+    pub fn query<Q>(&mut self, sql: Q) -> QueryResult<'_>
     where
         Query: From<Q>,
     {
@@ -411,7 +411,7 @@ impl ClientHandle {
 
     /// Executes Clickhouse `query` on Conn. The `name` is used to identify the query.
     /// Name will help debugging and logging.
-    pub fn named_query<Q>(&mut self, sql: Q, name: String) -> QueryResult
+    pub fn named_query<Q>(&mut self, sql: Q, name: String) -> QueryResult<'_>
     where
         Query: From<Q>,
     {

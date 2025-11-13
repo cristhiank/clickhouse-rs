@@ -38,7 +38,7 @@ impl fmt::Debug for OptionsSource {
 }
 
 impl OptionsSource {
-    pub(crate) fn get(&self) -> Result<Cow<Options>> {
+    pub(crate) fn get(&self) -> Result<Cow<'_, Options>> {
         let mut state = self.state.lock().unwrap();
         loop {
             *state = match &*state {

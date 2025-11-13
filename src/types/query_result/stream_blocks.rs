@@ -62,7 +62,7 @@ impl<'a> BlockStream<'a> {
         name: String,
         inner: PacketStream,
         skip_first_block: bool,
-    ) -> BlockStream {
+    ) -> BlockStream<'_> {
         BlockStream {
             client,
             name,
