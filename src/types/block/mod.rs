@@ -253,7 +253,7 @@ impl<K: ColumnType> Block<K> {
     }
 
     /// This method returns a iterator of rows.
-    pub fn rows(&self) -> Rows<K> {
+    pub fn rows(&self) -> Rows<'_, K> {
         Rows {
             row: 0,
             block_ref: BlockRef::Borrowed(self),

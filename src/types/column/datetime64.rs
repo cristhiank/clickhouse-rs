@@ -71,7 +71,7 @@ impl ColumnData for DateTime64ColumnData {
         self.data.push(stamp)
     }
 
-    fn at(&self, index: usize) -> ValueRef {
+    fn at(&self, index: usize) -> ValueRef<'_> {
         let value = self.data.at(index);
         ValueRef::DateTime64(value, &self.params)
     }

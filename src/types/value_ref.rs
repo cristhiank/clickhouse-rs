@@ -325,13 +325,13 @@ impl<'a> From<ValueRef<'a>> for Value {
 }
 
 impl<'a> From<&'a str> for ValueRef<'a> {
-    fn from(s: &str) -> ValueRef {
+    fn from(s: &'a str) -> ValueRef<'a> {
         ValueRef::String(s.as_bytes())
     }
 }
 
 impl<'a> From<&'a [u8]> for ValueRef<'a> {
-    fn from(bs: &[u8]) -> ValueRef {
+    fn from(bs: &'a [u8]) -> ValueRef<'a> {
         ValueRef::String(bs)
     }
 }
