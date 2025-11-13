@@ -31,6 +31,7 @@ impl<'a> QueryResult<'a> {
         let timeout = try_opt!(self.client.context.options.get()).query_timeout;
 
         with_timeout(
+            "fetch_all",
             async {
                 let blocks = self
                     .stream_all_blocks(false)

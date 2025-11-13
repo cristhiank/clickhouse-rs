@@ -281,6 +281,7 @@ impl Client {
         };
 
         with_timeout(
+            "connect",
             async move {
                 let addr = match &pool {
                     None => &options.addr,
@@ -363,6 +364,7 @@ impl ClientHandle {
         let timeout = try_opt!(self.context.options.get()).ping_timeout;
 
         with_timeout(
+            "ping",
             async move {
                 info!("[ping]");
 
@@ -443,6 +445,7 @@ impl ClientHandle {
         let context = self.context.clone();
         let query = Query::from(sql);
         with_timeout(
+            "execute",
             async {
                 self.wrap_future(move |c| {
                     info!("[execute query] {}", query.get_sql());
@@ -498,6 +501,7 @@ impl ClientHandle {
         let context = self.context.clone();
 
         with_timeout(
+            "insert",
             async {
                 self.wrap_future(move |c| {
                     info!("[insert]     {}", query.get_sql());
@@ -675,24 +679,42 @@ fn column_name_to_string(name: &str) -> Result<String> {
 }
 
 #[cfg(feature = "async_std")]
-async fn with_timeout<F, T>(future: F, duration: Duration) -> F::Output
+async fn with_timeout<F, T>(operation: &'static str, future: F, duration: Duration) -> F::Output
 where
     F: Future<Output = Result<T>>,
 {
     use async_std::io;
     use futures_util::future::TryFutureExt;
 
-    io::timeout(duration, future.map_err(Into::into))
-        .map_err(Into::into)
-        .await
+    match io::timeout(duration, future.map_err(Into::into)).await {
+        Ok(result) => result,
+        Err(err) => {
+            warn!(
+                "[timeout] operation={} exceeded {:?}; consider increasing the relevant timeout in Options",
+                operation,
+                duration
+            );
+            Err(err.into())
+        }
+    }
 }
 
 #[cfg(not(feature = "async_std"))]
-async fn with_timeout<F, T>(future: F, timeout: Duration) -> F::Output
+async fn with_timeout<F, T>(operation: &'static str, future: F, timeout: Duration) -> F::Output
 where
     F: Future<Output = Result<T>>,
 {
-    tokio::time::timeout(timeout, future).await?
+    match tokio::time::timeout(timeout, future).await {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                "[timeout] operation={} exceeded {:?}; consider increasing the relevant timeout in Options",
+                operation,
+                timeout
+            );
+            Err(Error::Driver(DriverError::Timeout))
+        }
+    }
 }
 
 #[cfg(test)]
