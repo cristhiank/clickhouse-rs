@@ -24,7 +24,7 @@ tokio_io = ["tokio"]
 
 [dependencies]
 byteorder = "^1.4"
-chrono-tz = "^0.8"
+chrono-tz = "^0.10"
 crossbeam = "^0.8"
 thiserror = "^1.0"
 futures-core = "^0.3"
