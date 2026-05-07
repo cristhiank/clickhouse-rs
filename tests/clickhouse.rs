@@ -1970,7 +1970,9 @@ async fn test_reusing_handle_after_streaming_exception() -> Result<(), Error> {
     drop(blocks);
     assert_eq!(pool.info().ongoing, 0);
 
-    let _ = client.query("SELECT 1").fetch_all().await;
+    let actual = client.query("SELECT 1 as A").fetch_all().await?;
+    let expected = Block::new().column("A", vec![1_u8]);
+    assert_eq!(expected, actual);
     Ok(())
 }
 

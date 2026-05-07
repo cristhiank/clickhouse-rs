@@ -806,7 +806,21 @@ mod test {
     #[test]
     fn test_size_of() {
         use std::mem;
-        assert_eq!(56, mem::size_of::<[Value; 1]>());
+
+        let size = mem::size_of::<Value>();
+        assert_eq!(size, mem::size_of::<[Value; 1]>());
+
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            size <= 64,
+            "Value should fit within one cache line on 64-bit targets; actual size: {size}"
+        );
+
+        #[cfg(target_pointer_width = "32")]
+        assert!(
+            size <= 56,
+            "Value size regressed on 32-bit targets; actual size: {size}"
+        );
     }
 
     #[test]

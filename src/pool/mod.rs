@@ -105,9 +105,12 @@ impl PoolBinding {
     }
 
     pub(crate) fn release(&mut self) {
-        let pool: Option<Pool> = self.take().into();
-        if let Some(pool) = pool {
-            pool.inner.release_conn();
+        match self.take() {
+            PoolBinding::None => {}
+            PoolBinding::Attached(pool) | PoolBinding::Detached(pool) => {
+                pool.inner.release_conn();
+                *self = PoolBinding::Detached(pool);
+            }
         }
     }
 }

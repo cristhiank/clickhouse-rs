@@ -619,7 +619,9 @@ impl ClientHandle {
 
     /// Check connection and try to reconnect if necessary.
     pub async fn check_connection(&mut self) -> Result<()> {
-        self.pool.detach();
+        if self.pool.is_attached() {
+            self.pool.detach();
+        }
 
         let source = self.context.options.clone();
         let pool = self.pool.clone();
@@ -885,8 +887,15 @@ pub(crate) mod test_misc {
     }
 
     #[cfg(feature = "tokio_io")]
+    fn server_pong_packet() -> Vec<u8> {
+        let mut encoder = binary::Encoder::new();
+        encoder.uvarint(binary::protocol::SERVER_PONG);
+        encoder.get_buffer()
+    }
+
+    #[cfg(feature = "tokio_io")]
     #[tokio::test]
-    async fn streaming_exception_releases_pool_ongoing() {
+    async fn streaming_exception_releases_pool_ongoing_and_allows_reconnect() {
         use std::str::FromStr;
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
@@ -896,12 +905,21 @@ pub(crate) mod test_misc {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
             let mut buf = [0; 4096];
+
+            let (mut socket, _) = listener.accept().await.unwrap();
             let _ = tokio::time::timeout(Duration::from_millis(100), socket.read(&mut buf)).await;
             socket.write_all(&server_hello_packet()).await.unwrap();
             let _ = tokio::time::timeout(Duration::from_millis(100), socket.read(&mut buf)).await;
             socket.write_all(&server_exception_packet()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            socket.shutdown().await.unwrap();
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(100), socket.read(&mut buf)).await;
+            socket.write_all(&server_hello_packet()).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(100), socket.read(&mut buf)).await;
+            socket.write_all(&server_pong_packet()).await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
             socket.shutdown().await.unwrap();
         });
@@ -921,5 +939,7 @@ pub(crate) mod test_misc {
         drop(blocks);
 
         assert_eq!(pool.info().ongoing, 0);
+        client.check_connection().await.unwrap();
+        assert_eq!(pool.info().ongoing, 1);
     }
 }
