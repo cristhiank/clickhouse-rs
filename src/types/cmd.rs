@@ -90,6 +90,12 @@ fn encode_query(query: &Query, context: &Context) -> Result<Vec<u8>> {
         encoder.string("");
         encoder.string(query.get_id()); // initial_query_id;
         encoder.string("[::ffff:127.0.0.1]:0");
+        if context.server_info.revision
+            >= protocol::DBMS_MIN_PROTOCOL_VERSION_WITH_INITIAL_QUERY_START_TIME
+        {
+            // initial_query_start_time_microseconds (int64, fixed 8 bytes)
+            encoder.write::<i64>(0i64);
+        }
         encoder.uvarint(1); // iface type TCP;
         encoder.string(hostname);
         encoder.string(hostname);
@@ -100,7 +106,26 @@ fn encode_query(query: &Query, context: &Context) -> Result<Vec<u8>> {
         encoder.string("");
     }
 
+    if context.server_info.revision
+        >= protocol::DBMS_MIN_PROTOCOL_VERSION_WITH_DISTRIBUTED_DEPTH
+    {
+        // distributed_depth (uvarint, 0 = top-level client query)
+        encoder.uvarint(0);
+    }
+
     if context.server_info.revision >= protocol::DBMS_MIN_REVISION_WITH_VERSION_PATCH {
+        encoder.uvarint(0);
+    }
+
+    if context.server_info.revision >= protocol::DBMS_MIN_REVISION_WITH_OPENTELEMETRY {
+        // OpenTelemetry header: 0 = absent, no trace_id/span_id/tracestate/flags follow.
+        encoder.write::<u8>(0u8);
+    }
+
+    if context.server_info.revision >= protocol::DBMS_MIN_REVISION_WITH_PARALLEL_REPLICAS {
+        // collaborate_with_initiator, count_participating_replicas, number_of_current_replica
+        encoder.uvarint(0);
+        encoder.uvarint(0);
         encoder.uvarint(0);
     }
 
@@ -116,6 +141,10 @@ fn encode_query(query: &Query, context: &Context) -> Result<Vec<u8>> {
 
     serialize_settings(&mut encoder, &options, settings_format);
 
+    if context.server_info.revision >= protocol::DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET {
+        encoder.string(""); // inter-server secret (empty for client→server)
+    }
+
     encoder.uvarint(protocol::STATE_COMPLETE);
 
     encoder.uvarint(if options.compression {
@@ -127,6 +156,25 @@ fn encode_query(query: &Query, context: &Context) -> Result<Vec<u8>> {
     let options = context.options.get()?;
 
     encoder.string(query.get_sql());
+
+    // Server-side query parameters (sent AFTER query text, BEFORE the data block).
+    // Wire shape per param: <name string><flags varint=2 (Custom)><quoted value | NULL repr>
+    // followed by an empty string as the end-of-params marker. Matches
+    // clickhouse-cpp Client::Impl::SendQuery exactly.
+    if context.server_info.revision >= protocol::DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS {
+        const PARAM_FLAG_CUSTOM: u64 = 2;
+        let params = query.get_params();
+        for (name, value) in params {
+            encoder.string(name);
+            encoder.uvarint(PARAM_FLAG_CUSTOM);
+            match value {
+                Some(v) => encoder.quoted_string(v),
+                None => encoder.param_null_representation(),
+            }
+        }
+        encoder.string(""); // end-of-params marker
+    }
+
     Block::<Simple>::default().send_data(&mut encoder, options.compression);
 
     Ok(encoder.get_buffer())

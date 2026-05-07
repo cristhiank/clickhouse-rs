@@ -44,8 +44,17 @@ impl<'i, T: Read> Parser<'i, T> {
             protocol::SERVER_DATA | protocol::SERVER_TOTALS | protocol::SERVER_EXTREMES => {
                 Ok(self.parse_block()?)
             }
+            protocol::SERVER_PROFILE_EVENTS => {
+                // Same wire format as SERVER_DATA: empty string + Block.
+                // Discard the block; we don't surface profile events to callers yet.
+                let _ = self.parse_block()?;
+                self.parse_packet(revision)
+            }
             protocol::SERVER_END_OF_STREAM => Ok(Packet::Eof(())),
-            _ => Err(Error::Driver(DriverError::UnknownPacket { packet })),
+            _ => {
+                warn!("unknown server packet code: {}", packet);
+                Err(Error::Driver(DriverError::UnknownPacket { packet }))
+            }
         }
     }
 
@@ -54,7 +63,7 @@ impl<'i, T: Read> Parser<'i, T> {
             None => Err(Error::Driver(DriverError::UnexpectedPacket)),
             Some(tz) => {
                 self.reader.skip_string()?;
-                let block = Block::load(&mut self.reader, tz, self.info.compress)?;
+                let block = Block::load(&mut self.reader, tz, self.info.compress, self.info.revision)?;
                 Ok(Packet::Block(block))
             }
         }

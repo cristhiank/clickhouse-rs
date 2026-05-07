@@ -293,7 +293,7 @@ mod test {
         block.write(&mut encoder, false);
 
         let mut reader = Cursor::new(encoder.get_buffer_ref());
-        let rblock = Block::load(&mut reader, *DEFAULT_TZ, false).unwrap();
+        let rblock = Block::load(&mut reader, *DEFAULT_TZ, false, 0).unwrap();
 
         assert_eq!(block, rblock);
     }

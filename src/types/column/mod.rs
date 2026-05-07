@@ -178,9 +178,23 @@ impl<K: ColumnType> Column<K> {
 }
 
 impl<K: ColumnType> Column<K> {
-    pub(crate) fn read<R: ReadEx>(reader: &mut R, size: usize, tz: Tz) -> Result<Column<K>> {
+    pub(crate) fn read<R: ReadEx>(
+        reader: &mut R,
+        size: usize,
+        tz: Tz,
+        revision: u64,
+    ) -> Result<Column<K>> {
         let name = reader.read_string()?;
         let type_name = reader.read_string()?;
+        if revision >= crate::binary::protocol::DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION {
+            let mut buf = [0u8; 1];
+            reader.read_bytes(&mut buf)?;
+            if buf[0] != 0 {
+                return Err(crate::errors::Error::Driver(
+                    crate::errors::DriverError::UnexpectedPacket,
+                ));
+            }
+        }
         let data =
             <dyn ColumnData>::load_data::<ArcColumnWrapper, _>(reader, &type_name, size, tz)?;
         let column = Self {

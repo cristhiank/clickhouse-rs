@@ -156,19 +156,19 @@ impl Block {
         }
     }
 
-    pub(crate) fn load<R>(reader: &mut R, tz: Tz, compress: bool) -> Result<Self>
+    pub(crate) fn load<R>(reader: &mut R, tz: Tz, compress: bool, revision: u64) -> Result<Self>
     where
         R: Read + ReadEx,
     {
         if compress {
             let mut cr = compressed::make(reader);
-            Self::raw_load(&mut cr, tz)
+            Self::raw_load(&mut cr, tz, revision)
         } else {
-            Self::raw_load(reader, tz)
+            Self::raw_load(reader, tz, revision)
         }
     }
 
-    fn raw_load<R>(reader: &mut R, tz: Tz) -> Result<Block<Simple>>
+    fn raw_load<R>(reader: &mut R, tz: Tz, revision: u64) -> Result<Block<Simple>>
     where
         R: ReadEx,
     {
@@ -179,7 +179,7 @@ impl Block {
         let num_rows = reader.read_uvarint()?;
 
         for _ in 0..num_columns {
-            let column = Column::read(reader, num_rows as usize, tz)?;
+            let column = Column::read(reader, num_rows as usize, tz, revision)?;
             block.append_column(column);
         }
 
@@ -486,7 +486,7 @@ mod test {
         ];
 
         let mut cursor = Cursor::new(&source[..]);
-        let actual = Block::load(&mut cursor, Tz::UTC, true).unwrap();
+        let actual = Block::load(&mut cursor, Tz::UTC, true, 0).unwrap();
 
         assert_eq!(actual, expected);
     }
@@ -495,7 +495,7 @@ mod test {
     fn test_read_empty_block() {
         let source = [1, 0, 2, 255, 255, 255, 255, 0, 0, 0];
         let mut cursor = Cursor::new(&source[..]);
-        match Block::<Simple>::load(&mut cursor, *DEFAULT_TZ, false) {
+        match Block::<Simple>::load(&mut cursor, *DEFAULT_TZ, false, 0) {
             Ok(block) => assert!(block.is_empty()),
             Err(_) => unreachable!(),
         }
@@ -591,7 +591,7 @@ mod test {
         block.write(&mut encoder, false);
 
         let mut reader = Cursor::new(encoder.get_buffer_ref());
-        let rblock = Block::load(&mut reader, *DEFAULT_TZ, false).unwrap();
+        let rblock = Block::load(&mut reader, *DEFAULT_TZ, false, 0).unwrap();
 
         assert_eq!(block, rblock);
     }

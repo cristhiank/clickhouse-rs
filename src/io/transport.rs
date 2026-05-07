@@ -46,6 +46,10 @@ pub(crate) struct ClickhouseTransport {
     buf_is_incomplete: bool,
     // Current buffer to write to the socket
     wr: io::Cursor<Vec<u8>>,
+    // Bytes that must be prepended to the next outgoing command's encoded
+    // payload (e.g. the post-handshake "addendum" empty-string for
+    // protocol revisions >= DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM).
+    pending_prefix: Vec<u8>,
     // Queued commands
     cmds: VecDeque<Cmd>,
     // Server time zone
@@ -84,6 +88,7 @@ impl ClickhouseTransport {
             rd: vec![],
             buf_is_incomplete: false,
             wr: io::Cursor::new(vec![]),
+            pending_prefix: Vec::new(),
             cmds: VecDeque::new(),
             info: TransportInfo {
                 timezone: None,
@@ -97,6 +102,14 @@ impl ClickhouseTransport {
 
     pub(crate) fn set_inside(&self, value: bool) {
         self.status.inside.store(value, Ordering::Release);
+    }
+
+    /// Queue the post-handshake "addendum" empty-string (varint length 0,
+    /// i.e. a single 0x00 byte) so it gets prepended to the next outgoing
+    /// command. Required for ClickHouse server protocol revisions
+    /// >= DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM (54458).
+    pub(crate) fn queue_handshake_addendum(&mut self) {
+        self.pending_prefix.push(0x00);
     }
 
     pub(crate) async fn clear(self) -> Result<Self> {
@@ -212,20 +225,15 @@ impl ClickhouseTransport {
     }
 
     fn wr_flush(&mut self, cx: &mut task::Context) -> io::Result<bool> {
-        // Making the borrow checker happy
-        let res = {
-            let buf = {
-                let pos = self.wr.position() as usize;
-                let buf = &self.wr.get_ref()[pos..];
+        let buf = {
+            let pos = self.wr.position() as usize;
+            let buf = &self.wr.get_ref()[pos..];
 
-                trace!("writing; remaining={:?}", buf);
-                buf
-            };
-
-            Pin::new(&mut self.inner).poll_write(cx, buf)
+            trace!("writing; remaining={:?}", buf);
+            buf
         };
 
-        match res {
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
             Poll::Ready(Ok(mut n)) => {
                 n += self.wr.position() as usize;
                 self.wr.set_position(n as u64);
@@ -245,8 +253,14 @@ impl ClickhouseTransport {
                 match self.cmds.pop_front() {
                     None => return Poll::Ready(Ok(())),
                     Some(cmd) => {
-                        let bytes = cmd.get_packed_command()?;
-                        self.wr = Cursor::new(bytes)
+                        let cmd_bytes = cmd.get_packed_command()?;
+                        if self.pending_prefix.is_empty() {
+                            self.wr = Cursor::new(cmd_bytes);
+                        } else {
+                            let mut bytes = std::mem::take(&mut self.pending_prefix);
+                            bytes.extend(cmd_bytes);
+                            self.wr = Cursor::new(bytes);
+                        }
                     }
                 }
             }

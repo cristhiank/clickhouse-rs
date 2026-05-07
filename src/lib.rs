@@ -128,6 +128,7 @@ use futures_util::{
 use log::{info, warn};
 
 use crate::{
+    binary::protocol,
     connecting_stream::ConnectingStream,
     errors::{DriverError, Error, Result},
     io::ClickhouseTransport,
@@ -350,6 +351,16 @@ impl ClientHandle {
         self.inner = h;
         if let Some(server_info) = info {
             self.context.server_info = server_info;
+            // Post-handshake addendum required for server protocol revisions
+            // >= 54458 (CH 22.10+). The addendum is an empty string queued
+            // as a 0x00 byte that gets prepended to the next outgoing command.
+            if self.context.server_info.revision
+                >= protocol::DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM
+            {
+                if let Some(ref mut transport) = self.inner {
+                    transport.queue_handshake_addendum();
+                }
+            }
             Ok(())
         } else {
             warn!("Server info is not received");
