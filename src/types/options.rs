@@ -31,7 +31,7 @@ impl fmt::Debug for OptionsSource {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let guard = self.state.lock().unwrap();
         match *guard {
-            State::Url(ref url) => write!(f, "Url({url})"),
+            State::Url(ref url) => write!(f, "Url({})", redact_url_str(url)),
             State::Raw(ref options) => write!(f, "{options:?}"),
         }
     }
@@ -141,8 +141,11 @@ impl Certificate {
     /// Parses a PEM-formatted X509 certificate.
     pub fn from_pem(der: &[u8]) -> Result<Certificate> {
         let certs = rustls_pemfile::certs(&mut der.as_ref())
-            .map(|result| result.unwrap())
-            .collect();
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|err| Error::Other(err.to_string().into()))?;
+        if certs.is_empty() {
+            return Err(Error::Other("No certificates found in PEM data.".into()));
+        }
         Ok(Certificate(Arc::new(certs)))
     }
 }
@@ -300,8 +303,9 @@ pub struct Options {
 
 impl fmt::Debug for Options {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let alt_hosts: Vec<_> = self.alt_hosts.iter().map(RedactedUrl).collect();
         f.debug_struct("Options")
-            .field("addr", &self.addr)
+            .field("addr", &RedactedUrl(&self.addr))
             .field("database", &self.database)
             .field("compression", &self.compression)
             .field("pool_min", &self.pool_min)
@@ -314,9 +318,36 @@ impl fmt::Debug for Options {
             .field("ping_timeout", &self.ping_timeout)
             .field("connection_timeout", &self.connection_timeout)
             .field("settings", &self.settings)
-            .field("alt_hosts", &self.alt_hosts)
+            .field("alt_hosts", &alt_hosts)
             .finish()
     }
+}
+
+pub(crate) struct RedactedUrl<'a>(pub(crate) &'a Url);
+
+impl fmt::Debug for RedactedUrl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for RedactedUrl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", redact_url(self.0))
+    }
+}
+
+fn redact_url(url: &Url) -> String {
+    let mut redacted = url.clone();
+    let _ = redacted.set_username("");
+    let _ = redacted.set_password(None);
+    redacted.to_string()
+}
+
+fn redact_url_str(url: &str) -> String {
+    Url::parse(url)
+        .map(|url| redact_url(&url))
+        .unwrap_or_else(|_| "[invalid URL]".into())
 }
 
 impl Default for Options {
@@ -545,6 +576,8 @@ fn from_url(url_str: &str) -> Result<Options> {
     let mut addr = url.clone();
     addr.set_path("");
     addr.set_query(None);
+    let _ = addr.set_username("");
+    let _ = addr.set_password(None);
 
     let port = url.port().or(Some(9000));
     addr.set_port(port).map_err(|_| UrlError::Invalid)?;
@@ -734,7 +767,7 @@ mod test {
             Options {
                 username: "username".into(),
                 password: "password".into(),
-                addr: Url::parse("tcp://username:password@host1:9001").unwrap(),
+                addr: Url::parse("tcp://host1:9001").unwrap(),
                 database: "database".into(),
                 keepalive: Some(Duration::from_secs(99)),
                 ping_timeout: Duration::from_millis(42),
@@ -749,13 +782,20 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "tls-rustls")]
+    fn test_rustls_certificate_from_invalid_pem_returns_error() {
+        let malformed = b"-----BEGIN CERTIFICATE-----\n@@@\n-----END CERTIFICATE-----\n";
+        assert!(Certificate::from_pem(malformed).is_err());
+    }
+
+    #[test]
     fn test_parse_encoded_creds() {
         let url = "tcp://user%20%3Cbar%3E:password%20%3Cbar%3E@host1:9001/database?ping_timeout=42ms&keepalive=99s&compression=lz4&connection_timeout=10s";
         assert_eq!(
             Options {
                 username: "user <bar>".into(),
                 password: "password <bar>".into(),
-                addr: Url::parse("tcp://user%20%3Cbar%3E:password%20%3Cbar%3E@host1:9001").unwrap(),
+                addr: Url::parse("tcp://host1:9001").unwrap(),
                 database: "database".into(),
                 keepalive: Some(Duration::from_secs(99)),
                 ping_timeout: Duration::from_millis(42),
@@ -774,7 +814,7 @@ mod test {
             Options {
                 username: "username".into(),
                 password: "password".into(),
-                addr: Url::parse("tcp://username:password@host1:9001").unwrap(),
+                addr: Url::parse("tcp://host1:9001").unwrap(),
                 database: "database".into(),
                 keepalive: Some(Duration::from_secs(99)),
                 ping_timeout: Duration::from_millis(42),
@@ -784,6 +824,33 @@ mod test {
             },
             from_url(url).unwrap(),
         );
+    }
+
+    #[test]
+    fn test_debug_redacts_credentials_but_preserves_auth_fields() {
+        let url = "tcp://username:password@host1:9001/database";
+        let options = from_url(url).unwrap();
+        assert_eq!(options.username, "username");
+        assert_eq!(options.password, "password");
+
+        let debug = format!("{options:?}");
+        assert!(debug.contains("tcp://host1:9001"));
+        assert!(!debug.contains("username"));
+        assert!(!debug.contains("password"));
+
+        let source = url.into_options_src();
+        let source_debug = format!("{source:?}");
+        assert!(source_debug.contains("tcp://host1:9001/database"));
+        assert!(!source_debug.contains("username"));
+        assert!(!source_debug.contains("password"));
+
+        let context = crate::types::Context {
+            options: source,
+            ..crate::types::Context::default()
+        };
+        let context_debug = format!("{context:?}");
+        assert!(!context_debug.contains("username"));
+        assert!(!context_debug.contains("password"));
     }
 
     #[test]

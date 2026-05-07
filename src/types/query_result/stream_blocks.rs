@@ -113,7 +113,7 @@ impl<'a> Stream for BlockStream<'a> {
             match packet {
                 Packet::Eof(inner) => {
                     self.client.inner = Some(inner);
-                    if !self.client.pool.is_attached() {
+                    if !self.client.pool.is_attached() && self.client.pool.is_some() {
                         self.client.pool.attach();
                     }
                     self.state = BlockStreamState::Finished;
@@ -125,7 +125,10 @@ impl<'a> Stream for BlockStream<'a> {
                 }
                 Packet::ProfileInfo(_) | Packet::Progress(_) => {}
                 Packet::Exception(exception) => {
-                    self.state = BlockStreamState::Finished;
+                    self.state = BlockStreamState::Error;
+                    let _ = self.inner.take_transport();
+                    self.client.inner = None;
+                    self.client.pool.release();
 
                     error!(
                         "{}: [BlockStream] Received exception packet (Block Count {}): {:?}",

@@ -136,7 +136,7 @@ use crate::{
     types::{
         block::{ChunkIterator, INSERT_BLOCK_SIZE},
         query_result::stream_blocks::BlockStream,
-        Cmd, Context, IntoOptions, OptionsSource, Packet, Query, QueryResult, SqlType,
+        Cmd, Context, IntoOptions, OptionsSource, Packet, Query, QueryResult, RedactedUrl, SqlType,
     },
 };
 pub use crate::{
@@ -288,7 +288,7 @@ impl Client {
                     Some(p) => p.get_addr(),
                 };
 
-                info!("try to connect to {}", addr);
+                info!("try to connect to {}", RedactedUrl(addr));
                 if addr.port() == Some(8123) {
                     warn!("You should use port 9000 instead of 8123 because clickhouse-rs work through the binary interface.");
                 }
@@ -439,12 +439,10 @@ impl ClientHandle {
     where
         Query: From<Q>,
     {
-        let timeout = try_opt!(self.context.options.get())
-            .execute_timeout
-            .unwrap_or_else(|| Duration::from_secs(0));
+        let timeout = try_opt!(self.context.options.get()).execute_timeout;
         let context = self.context.clone();
         let query = Query::from(sql);
-        with_timeout(
+        with_optional_timeout(
             "execute",
             async {
                 self.wrap_future(move |c| {
@@ -471,7 +469,7 @@ impl ClientHandle {
                             }
                         }
 
-                        Ok(h.unwrap())
+                        h.ok_or_else(unexpected_eof_error)
                     }
                 })
                 .await
@@ -494,13 +492,11 @@ impl ClientHandle {
     }
 
     async fn insert_(&mut self, query: Query, block: &Block) -> Result<ClickhouseTransport> {
-        let timeout = try_opt!(self.context.options.get())
-            .insert_timeout
-            .unwrap_or_else(|| Duration::from_secs(0));
+        let timeout = try_opt!(self.context.options.get()).insert_timeout;
 
         let context = self.context.clone();
 
-        with_timeout(
+        with_optional_timeout(
             "insert",
             async {
                 self.wrap_future(move |c| {
@@ -548,7 +544,7 @@ impl ClientHandle {
     ) -> Result<(ClickhouseTransport, Block)> {
         let stream = transport.call(Cmd::SendQuery(query, context));
         let (transport, b) = stream.read_block().await?;
-        let dst_block = b.unwrap();
+        let dst_block = b.ok_or(Error::Driver(DriverError::UnexpectedPacket))?;
         Ok((transport, dst_block))
     }
 
@@ -717,10 +713,35 @@ where
     }
 }
 
+async fn with_optional_timeout<F, T>(
+    operation: &'static str,
+    future: F,
+    timeout: Option<Duration>,
+) -> F::Output
+where
+    F: Future<Output = Result<T>>,
+{
+    match timeout {
+        Some(duration) => with_timeout(operation, future, duration).await,
+        None => future.await,
+    }
+}
+
+fn unexpected_eof_error() -> Error {
+    Error::Io(std::io::Error::new(
+        ErrorKind::UnexpectedEof,
+        "Expected packet, got EOF.",
+    ))
+}
+
 #[cfg(test)]
 pub(crate) mod test_misc {
-    use crate::*;
-    use std::env;
+    use crate::{
+        errors::{DriverError, Error},
+        types::Query,
+        *,
+    };
+    use std::{env, io::ErrorKind, time::Duration};
 
     use lazy_static::lazy_static;
 
@@ -736,5 +757,169 @@ pub(crate) mod test_misc {
         assert_eq!(column_name_to_string("234").unwrap(), "234");
         assert_eq!(column_name_to_string("ns:attr").unwrap(), "`ns:attr`");
         assert!(column_name_to_string("`").is_err());
+    }
+
+    #[cfg(feature = "tokio_io")]
+    async fn transport_with_server_response(bytes: &'static [u8]) -> ClickhouseTransport {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, TcpStream},
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 1024];
+            let _ = tokio::time::timeout(Duration::from_millis(100), socket.read(&mut buf)).await;
+            if !bytes.is_empty() {
+                socket.write_all(bytes).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            socket.shutdown().await.unwrap();
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        ClickhouseTransport::new(client.into(), false, None)
+    }
+
+    #[cfg(feature = "tokio_io")]
+    fn handle_with_transport(transport: ClickhouseTransport) -> ClientHandle {
+        let options = Options::default()
+            .ping_before_query(false)
+            .execute_timeout(None)
+            .insert_timeout(None);
+        ClientHandle {
+            inner: Some(transport),
+            context: Context {
+                options: options.into_options_src(),
+                ..Context::default()
+            },
+            pool: PoolBinding::None,
+            used: false.into(),
+        }
+    }
+
+    #[cfg(feature = "tokio_io")]
+    #[tokio::test]
+    async fn execute_eof_returns_unexpected_eof() {
+        let transport = transport_with_server_response(&[]).await;
+        let mut handle = handle_with_transport(transport);
+        let err = match handle.execute_("SELECT 1").await {
+            Ok(_) => panic!("execute should fail on EOF"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::Io(ref io) if io.kind() == ErrorKind::UnexpectedEof));
+    }
+
+    #[cfg(feature = "tokio_io")]
+    #[tokio::test]
+    async fn send_insert_query_missing_header_block_returns_unexpected_packet() {
+        let transport =
+            transport_with_server_response(&[binary::protocol::SERVER_END_OF_STREAM as u8]).await;
+        let err = match ClientHandle::send_insert_query_(
+            transport,
+            Context::default(),
+            Query::from("INSERT INTO table VALUES"),
+        )
+        .await
+        {
+            Ok(_) => panic!("send_insert_query should fail without a header block"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Error::Driver(DriverError::UnexpectedPacket)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "tokio_io")]
+    #[tokio::test]
+    async fn optional_timeout_none_bypasses_timeout_wrapper() {
+        let result = with_optional_timeout(
+            "test",
+            async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Ok::<_, Error>(())
+            },
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let result = with_optional_timeout(
+            "test",
+            async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Ok::<_, Error>(())
+            },
+            Some(Duration::ZERO),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Driver(DriverError::Timeout))));
+    }
+
+    #[cfg(feature = "tokio_io")]
+    fn server_hello_packet() -> Vec<u8> {
+        let mut encoder = binary::Encoder::new();
+        encoder.uvarint(binary::protocol::SERVER_HELLO);
+        encoder.string("ClickHouse");
+        encoder.uvarint(22);
+        encoder.uvarint(8);
+        encoder.uvarint(binary::protocol::DBMS_MIN_REVISION_WITH_VERSION_PATCH);
+        encoder.string("UTC");
+        encoder.string("test-server");
+        encoder.uvarint(1);
+        encoder.get_buffer()
+    }
+
+    #[cfg(feature = "tokio_io")]
+    fn server_exception_packet() -> Vec<u8> {
+        let mut encoder = binary::Encoder::new();
+        encoder.uvarint(binary::protocol::SERVER_EXCEPTION);
+        encoder.write(1_u32);
+        encoder.string("TestException");
+        encoder.string("stream failed");
+        encoder.string("");
+        encoder.get_buffer()
+    }
+
+    #[cfg(feature = "tokio_io")]
+    #[tokio::test]
+    async fn streaming_exception_releases_pool_ongoing() {
+        use std::str::FromStr;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let _ = tokio::time::timeout(Duration::from_millis(100), socket.read(&mut buf)).await;
+            socket.write_all(&server_hello_packet()).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(100), socket.read(&mut buf)).await;
+            socket.write_all(&server_exception_packet()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            socket.shutdown().await.unwrap();
+        });
+
+        let options = Options::from_str(&format!(
+            "tcp://{}?pool_min=0&pool_max=1&ping_before_query=false",
+            addr
+        ))
+        .unwrap();
+        let pool = Pool::new(options);
+        let mut client = pool.get_handle().await.unwrap();
+        assert_eq!(pool.info().ongoing, 1);
+
+        let mut blocks = client.query("SELECT 1").stream_blocks();
+        let err = blocks.next().await.expect("stream should yield an error");
+        assert!(matches!(err, Err(Error::Server(_))));
+        drop(blocks);
+
+        assert_eq!(pool.info().ongoing, 0);
     }
 }

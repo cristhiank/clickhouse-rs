@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    io::{self, Cursor},
+    io::{self, Cursor, ErrorKind},
     pin::Pin,
     ptr,
     sync::{
@@ -319,12 +319,20 @@ impl PacketStream {
             }
         }
 
-        Ok((h.unwrap(), b))
+        let transport = h.ok_or_else(unexpected_eof_error)?;
+        Ok((transport, b))
     }
 
     pub(crate) fn take_transport(&mut self) -> Option<ClickhouseTransport> {
         self.inner.take()
     }
+}
+
+fn unexpected_eof_error() -> Error {
+    Error::Io(io::Error::new(
+        ErrorKind::UnexpectedEof,
+        "Expected packet, got EOF.",
+    ))
 }
 
 impl Stream for PacketStream {
@@ -419,4 +427,43 @@ impl ClickhouseTransport {
 
 fn is_block<T>(packet: &Option<Packet<T>>) -> bool {
     matches!(packet, Some(Packet::Block(_)))
+}
+
+#[cfg(all(test, feature = "tokio_io"))]
+mod tests {
+    use super::*;
+    use crate::types::Cmd;
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    async fn transport_with_server_response(bytes: &'static [u8]) -> ClickhouseTransport {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 1024];
+            let _ = tokio::time::timeout(Duration::from_millis(100), socket.read(&mut buf)).await;
+            if !bytes.is_empty() {
+                socket.write_all(bytes).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            socket.shutdown().await.unwrap();
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        ClickhouseTransport::new(client.into(), false, None)
+    }
+
+    #[tokio::test]
+    async fn read_block_eof_without_transport_returns_unexpected_eof() {
+        let transport = transport_with_server_response(&[]).await;
+        let err = match transport.call(Cmd::Ping).read_block().await {
+            Ok(_) => panic!("read_block should fail on EOF"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::Io(ref io) if io.kind() == ErrorKind::UnexpectedEof));
+    }
 }

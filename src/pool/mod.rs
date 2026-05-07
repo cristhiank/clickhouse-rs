@@ -103,6 +103,13 @@ impl PoolBinding {
             _ => unreachable!(),
         }
     }
+
+    pub(crate) fn release(&mut self) {
+        let pool: Option<Pool> = self.take().into();
+        if let Some(pool) = pool {
+            pool.inner.release_conn();
+        }
+    }
 }
 
 /// Asynchronous pool of Clickhouse connections.

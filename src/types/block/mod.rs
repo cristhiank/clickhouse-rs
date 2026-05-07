@@ -117,8 +117,12 @@ impl<K: ColumnType> AsRef<Block<K>> for Block<K> {
 
 impl ColumnIdx for usize {
     #[inline(always)]
-    fn get_index<K: ColumnType>(&self, _: &[Column<K>]) -> Result<usize> {
-        Ok(*self)
+    fn get_index<K: ColumnType>(&self, columns: &[Column<K>]) -> Result<usize> {
+        if *self < columns.len() {
+            Ok(*self)
+        } else {
+            Err(Error::FromSql(FromSqlError::OutOfRange))
+        }
     }
 }
 
@@ -224,7 +228,12 @@ impl<K: ColumnType> Block<K> {
         I: ColumnIdx + Copy,
     {
         let column_index = col.get_index(self.columns())?;
-        T::from_sql(self.columns[column_index].at(row))
+        let column = &self.columns[column_index];
+        if row < column.len() {
+            T::from_sql(column.at(row))
+        } else {
+            Err(Error::FromSql(FromSqlError::OutOfRange))
+        }
     }
 
     /// Add new column into this block
@@ -272,8 +281,9 @@ impl<K: ColumnType> Block<K> {
         I: ColumnIdx + Copy,
     {
         let column_index = col.get_index(self.columns())?;
-        let column = &self.columns[column_index];
-        Ok(column)
+        self.columns
+            .get(column_index)
+            .ok_or(Error::FromSql(FromSqlError::OutOfRange))
     }
 }
 
@@ -416,6 +426,25 @@ impl<K: ColumnType> fmt::Debug for Block<K> {
         }
 
         print_line(f, &titles_len, "\n\u{2514}", '┴', "\u{2518}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_row_out_of_range_returns_from_sql_error() {
+        let block = Block::new().column("value", vec![1_u32]);
+        let err = block.get::<u32, _>(1, "value").unwrap_err();
+        assert!(matches!(err, Error::FromSql(FromSqlError::OutOfRange)));
+    }
+
+    #[test]
+    fn get_numeric_column_out_of_range_returns_from_sql_error() {
+        let block = Block::new().column("value", vec![1_u32]);
+        let err = block.get::<u32, _>(0, 1_usize).unwrap_err();
+        assert!(matches!(err, Error::FromSql(FromSqlError::OutOfRange)));
     }
 }
 

@@ -26,7 +26,7 @@ pub(crate) use self::{
     cmd::Cmd,
     date_converter::DateConverter,
     marshal::Marshal,
-    options::{IntoOptions, OptionsSource},
+    options::{IntoOptions, OptionsSource, RedactedUrl},
     stat_buffer::StatBuffer,
     unmarshal::Unmarshal,
 };

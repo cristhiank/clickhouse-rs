@@ -128,8 +128,9 @@ fn find_chunk(index: &[usize], ix: usize) -> usize {
 mod test {
     use std::sync::Arc;
 
-    use crate::types::column::{
-        column_data::ColumnDataExt, numeric::VectorColumnData, string::StringColumnData,
+    use crate::types::{
+        column::{column_data::ColumnData, numeric::VectorColumnData, string::StringColumnData},
+        Value,
     };
 
     use super::*;
@@ -218,15 +219,15 @@ mod test {
 
     fn make_string_column() -> ArcColumnData {
         let mut data = StringColumnData::with_capacity(1);
-        data.append("13298a5f-6a10-4fbe-9644-807f7ebf82cc".to_string());
-        data.append("df0e62bb-c0db-4728-a558-821f8e8da38c".to_string());
+        data.push(Value::from("13298a5f-6a10-4fbe-9644-807f7ebf82cc"));
+        data.push(Value::from("df0e62bb-c0db-4728-a558-821f8e8da38c"));
         Arc::new(data)
     }
 
     fn make_num_column() -> ArcColumnData {
         let mut data = VectorColumnData::<u32>::with_capacity(1);
-        data.append(1_u32);
-        data.append(2_u32);
+        data.push(Value::from(1_u32));
+        data.push(Value::from(2_u32));
         Arc::new(data)
     }
 }

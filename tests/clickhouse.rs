@@ -1960,6 +1960,22 @@ async fn test_reusing_handle_after_dropped() -> Result<(), Error> {
 
 #[cfg(feature = "tokio_io")]
 #[tokio::test]
+async fn test_reusing_handle_after_streaming_exception() -> Result<(), Error> {
+    let pool = Pool::new(database_url());
+    let mut client = pool.get_handle().await?;
+
+    let mut blocks = client.query("SELECT throwIf(1)").stream_blocks();
+    let err = blocks.next().await.expect("stream should yield an error");
+    assert!(err.is_err());
+    drop(blocks);
+    assert_eq!(pool.info().ongoing, 0);
+
+    let _ = client.query("SELECT 1").fetch_all().await;
+    Ok(())
+}
+
+#[cfg(feature = "tokio_io")]
+#[tokio::test]
 async fn test_non_alphanumeric_columns() -> Result<(), Error> {
     let ddl = r"
         CREATE TABLE IF NOT EXISTS clickhouse_non_alphanumeric_columns (
