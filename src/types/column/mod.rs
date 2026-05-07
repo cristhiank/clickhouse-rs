@@ -225,9 +225,14 @@ impl<K: ColumnType> Column<K> {
         self.data.at(index)
     }
 
-    pub(crate) fn write(&self, encoder: &mut Encoder) {
+    pub(crate) fn write(&self, encoder: &mut Encoder, revision: u64) {
         encoder.string(&self.name);
         encoder.string(self.data.sql_type().to_string().as_ref());
+        if revision >= crate::binary::protocol::DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION {
+            // has_custom = 0: no custom serialization info follows. Mirrors what
+            // `read` expects above. Required since revision 54454 even for sends.
+            encoder.write::<u8>(0u8);
+        }
         let len = self.data.len();
         self.data.save(encoder, 0, len);
     }

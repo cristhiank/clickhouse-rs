@@ -290,7 +290,7 @@ mod test {
         let block = Block::<Simple>::new().column("vals", vec![source]);
 
         let mut encoder = Encoder::new();
-        block.write(&mut encoder, false);
+        block.write(&mut encoder, false, 0);
 
         let mut reader = Cursor::new(encoder.get_buffer_ref());
         let rblock = Block::load(&mut reader, *DEFAULT_TZ, false, 0).unwrap();

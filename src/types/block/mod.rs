@@ -329,10 +329,10 @@ impl<K: ColumnType> Block<K> {
         })
     }
 
-    pub(crate) fn write(&self, encoder: &mut Encoder, compress: bool) {
+    pub(crate) fn write(&self, encoder: &mut Encoder, compress: bool, revision: u64) {
         if compress {
             let mut tmp_encoder = Encoder::new();
-            self.write(&mut tmp_encoder, false);
+            self.write(&mut tmp_encoder, false, revision);
             let tmp = tmp_encoder.get_buffer();
 
             let mut buf = Vec::new();
@@ -366,15 +366,15 @@ impl<K: ColumnType> Block<K> {
             encoder.uvarint(self.row_count() as u64);
 
             for column in &self.columns {
-                column.write(encoder);
+                column.write(encoder, revision);
             }
         }
     }
 
-    pub(crate) fn send_data(&self, encoder: &mut Encoder, compress: bool) {
+    pub(crate) fn send_data(&self, encoder: &mut Encoder, compress: bool, revision: u64) {
         encoder.uvarint(protocol::CLIENT_DATA);
         encoder.string(""); // temporary table
-        self.write(encoder, compress);
+        self.write(encoder, compress, revision);
     }
 
     pub(crate) fn chunks(self, n: usize) -> ChunkIterator<K> {
@@ -469,7 +469,7 @@ mod test {
         let block = Block::<Simple>::new().column("s", vec!["abc"]);
 
         let mut encoder = Encoder::new();
-        block.write(&mut encoder, true);
+        block.write(&mut encoder, true, 0);
 
         let actual = encoder.get_buffer();
         assert_eq!(actual, expected);
@@ -588,7 +588,7 @@ mod test {
         let block = Block::<Simple>::new().column("y", vec![Some(1_u8), None]);
 
         let mut encoder = Encoder::new();
-        block.write(&mut encoder, false);
+        block.write(&mut encoder, false, 0);
 
         let mut reader = Cursor::new(encoder.get_buffer_ref());
         let rblock = Block::load(&mut reader, *DEFAULT_TZ, false, 0).unwrap();

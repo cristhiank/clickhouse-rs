@@ -175,7 +175,7 @@ fn encode_query(query: &Query, context: &Context) -> Result<Vec<u8>> {
         encoder.string(""); // end-of-params marker
     }
 
-    Block::<Simple>::default().send_data(&mut encoder, options.compression);
+    Block::<Simple>::default().send_data(&mut encoder, options.compression, context.server_info.revision);
 
     Ok(encoder.get_buffer())
 }
@@ -207,7 +207,7 @@ fn serialize_settings(encoder: &mut Encoder, options: &Options, format: Settings
 fn encode_data(block: &Block, context: &Context) -> Result<Vec<u8>> {
     let mut encoder = Encoder::new();
     let options = context.options.get()?;
-    block.send_data(&mut encoder, options.compression);
+    block.send_data(&mut encoder, options.compression, context.server_info.revision);
     Ok(encoder.get_buffer())
 }
 
