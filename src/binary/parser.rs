@@ -54,7 +54,7 @@ impl<'i, T: Read> Parser<'i, T> {
             None => Err(Error::Driver(DriverError::UnexpectedPacket)),
             Some(tz) => {
                 self.reader.skip_string()?;
-                let block = Block::load(&mut self.reader, tz, self.info.compress)?;
+                let block = Block::load(&mut self.reader, tz, self.info.compress, self.info.revision)?;
                 Ok(Packet::Block(block))
             }
         }

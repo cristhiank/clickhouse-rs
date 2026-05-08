@@ -156,19 +156,19 @@ impl Block {
         }
     }
 
-    pub(crate) fn load<R>(reader: &mut R, tz: Tz, compress: bool) -> Result<Self>
+    pub(crate) fn load<R>(reader: &mut R, tz: Tz, compress: bool, server_revision: u64) -> Result<Self>
     where
         R: Read + ReadEx,
     {
         if compress {
             let mut cr = compressed::make(reader);
-            Self::raw_load(&mut cr, tz)
+            Self::raw_load(&mut cr, tz, server_revision)
         } else {
-            Self::raw_load(reader, tz)
+            Self::raw_load(reader, tz, server_revision)
         }
     }
 
-    fn raw_load<R>(reader: &mut R, tz: Tz) -> Result<Block<Simple>>
+    fn raw_load<R>(reader: &mut R, tz: Tz, server_revision: u64) -> Result<Block<Simple>>
     where
         R: ReadEx,
     {
@@ -179,7 +179,7 @@ impl Block {
         let num_rows = reader.read_uvarint()?;
 
         for _ in 0..num_columns {
-            let column = Column::read(reader, num_rows as usize, tz)?;
+            let column = Column::read(reader, num_rows as usize, tz, server_revision)?;
             block.append_column(column);
         }
 
@@ -329,10 +329,10 @@ impl<K: ColumnType> Block<K> {
         })
     }
 
-    pub(crate) fn write(&self, encoder: &mut Encoder, compress: bool) {
+    pub(crate) fn write(&self, encoder: &mut Encoder, compress: bool, server_revision: u64) {
         if compress {
             let mut tmp_encoder = Encoder::new();
-            self.write(&mut tmp_encoder, false);
+            self.write(&mut tmp_encoder, false, server_revision);
             let tmp = tmp_encoder.get_buffer();
 
             let mut buf = Vec::new();
@@ -366,15 +366,15 @@ impl<K: ColumnType> Block<K> {
             encoder.uvarint(self.row_count() as u64);
 
             for column in &self.columns {
-                column.write(encoder);
+                column.write(encoder, server_revision);
             }
         }
     }
 
-    pub(crate) fn send_data(&self, encoder: &mut Encoder, compress: bool) {
+    pub(crate) fn send_data(&self, encoder: &mut Encoder, compress: bool, server_revision: u64) {
         encoder.uvarint(protocol::CLIENT_DATA);
         encoder.string(""); // temporary table
-        self.write(encoder, compress);
+        self.write(encoder, compress, server_revision);
     }
 
     pub(crate) fn chunks(self, n: usize) -> ChunkIterator<K> {
@@ -454,7 +454,7 @@ mod test {
     fn test_write_default() {
         let expected = [1_u8, 0, 2, 255, 255, 255, 255, 0, 0, 0];
         let mut encoder = Encoder::new();
-        Block::<Simple>::default().write(&mut encoder, false);
+        Block::<Simple>::default().write(&mut encoder, false, 0);
         assert_eq!(encoder.get_buffer_ref(), &expected)
     }
 
@@ -469,7 +469,7 @@ mod test {
         let block = Block::<Simple>::new().column("s", vec!["abc"]);
 
         let mut encoder = Encoder::new();
-        block.write(&mut encoder, true);
+        block.write(&mut encoder, true, 0);
 
         let actual = encoder.get_buffer();
         assert_eq!(actual, expected);
@@ -486,7 +486,7 @@ mod test {
         ];
 
         let mut cursor = Cursor::new(&source[..]);
-        let actual = Block::load(&mut cursor, Tz::UTC, true).unwrap();
+        let actual = Block::load(&mut cursor, Tz::UTC, true, 0).unwrap();
 
         assert_eq!(actual, expected);
     }
@@ -495,7 +495,7 @@ mod test {
     fn test_read_empty_block() {
         let source = [1, 0, 2, 255, 255, 255, 255, 0, 0, 0];
         let mut cursor = Cursor::new(&source[..]);
-        match Block::<Simple>::load(&mut cursor, *DEFAULT_TZ, false) {
+        match Block::<Simple>::load(&mut cursor, *DEFAULT_TZ, false, 0) {
             Ok(block) => assert!(block.is_empty()),
             Err(_) => unreachable!(),
         }
@@ -588,12 +588,68 @@ mod test {
         let block = Block::<Simple>::new().column("y", vec![Some(1_u8), None]);
 
         let mut encoder = Encoder::new();
-        block.write(&mut encoder, false);
+        block.write(&mut encoder, false, 0);
 
         let mut reader = Cursor::new(encoder.get_buffer_ref());
-        let rblock = Block::load(&mut reader, *DEFAULT_TZ, false).unwrap();
+        let rblock = Block::load(&mut reader, *DEFAULT_TZ, false, 0).unwrap();
 
         assert_eq!(block, rblock);
+    }
+
+    #[test]
+    fn test_write_and_read_with_custom_serialization_marker() {
+        // At revision >= 54454, a zero custom-serialization marker byte is written after each
+        // column type, and the reader must consume it successfully.
+        let block = Block::<Simple>::new().column("y", vec![Some(1_u8), None]);
+        let server_revision = 54454_u64;
+
+        let mut encoder = Encoder::new();
+        block.write(&mut encoder, false, server_revision);
+
+        let mut reader = Cursor::new(encoder.get_buffer_ref());
+        let rblock = Block::load(&mut reader, *DEFAULT_TZ, false, server_revision).unwrap();
+
+        assert_eq!(block, rblock);
+    }
+
+    #[test]
+    fn test_read_nonzero_custom_serialization_marker_errors() {
+        // Build a block byte stream for revision 54454 but with a nonzero custom-serialization
+        // marker. The reader must return UnsupportedCustomSerialization.
+        let block = Block::<Simple>::new().column("z", vec![1_u8]);
+        let server_revision = 54454_u64;
+
+        let mut encoder = Encoder::new();
+        block.write(&mut encoder, false, server_revision);
+        let mut bytes = encoder.get_buffer();
+
+        // The custom marker 0x00 is placed after the type name string in the column.
+        // Flip it to 0x01 to trigger the error. The marker appears after the type string "UInt8".
+        // "UInt8" as a length-prefixed string: [0x05, b'U', b'i', b'n', b't', b'8', 0x00].
+        // Find it and set the trailing 0x00 to 0x01.
+        let type_str = b"\x05UInt8";
+        if let Some(pos) = bytes
+            .windows(type_str.len())
+            .position(|w| w == type_str)
+        {
+            let marker_pos = pos + type_str.len();
+            if marker_pos < bytes.len() {
+                bytes[marker_pos] = 0x01;
+            }
+        }
+
+        let mut reader = Cursor::new(&bytes[..]);
+        let result = Block::<Simple>::load(&mut reader, *DEFAULT_TZ, false, server_revision);
+        assert!(
+            result.is_err(),
+            "nonzero custom-serialization marker must error"
+        );
+        let err_str = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_str.contains("UnsupportedCustomSerialization"),
+            "error must mention UnsupportedCustomSerialization, got: {}",
+            err_str
+        );
     }
 
     #[test]

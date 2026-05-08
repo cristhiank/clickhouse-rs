@@ -16,7 +16,7 @@ pub use self::{
     from_sql::{FromSql, FromSqlResult},
     options::Options,
     options::{SettingType, SettingValue},
-    query::Query,
+    query::{Query, QueryParameterValue},
     query_result::QueryResult,
     value::Value,
     value_ref::ValueRef,

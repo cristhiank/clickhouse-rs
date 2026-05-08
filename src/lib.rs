@@ -350,6 +350,22 @@ impl ClientHandle {
         self.inner = h;
         if let Some(server_info) = info {
             self.context.server_info = server_info;
+
+            // If the server supports addendums (revision >= 54458), immediately send
+            // an empty quota-key addendum. This has no packet type — it is a raw
+            // varint(0) (empty string) flushed directly after the hello handshake.
+            if self.context.server_info.revision
+                >= crate::binary::protocol::DBMS_MIN_REVISION_WITH_ADDENDUM
+            {
+                if let Some(ref mut transport) = self.inner {
+                    // Empty string = varint(0) = single byte 0x00.
+                    transport.push_raw_bytes(vec![0x00]);
+                    futures_util::future::poll_fn(|cx| transport.poll_flush_wr(cx))
+                        .await
+                        .map_err(Error::Io)?;
+                }
+            }
+
             Ok(())
         } else {
             warn!("Server info is not received");
