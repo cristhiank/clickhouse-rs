@@ -480,6 +480,7 @@ impl ClientHandle {
                                 Ok(Packet::Eof(inner)) => h = Some(inner),
                                 Ok(Packet::Block(_))
                                 | Ok(Packet::ProfileInfo(_))
+                                | Ok(Packet::ProfileEvents(_))
                                 | Ok(Packet::Progress(_)) => (),
                                 Ok(Packet::Exception(e)) => return Err(Error::Server(e)),
                                 Err(e) => return Err(Error::Io(e)),

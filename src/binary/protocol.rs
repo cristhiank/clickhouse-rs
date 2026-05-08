@@ -39,3 +39,4 @@ pub const SERVER_EXTREMES: u64 = 8;
 pub const _SERVER_TABLES_STATUS_RESPONSE: u64 = 9;
 pub const _SERVER_LOG: u64 = 10;
 pub const SERVER_TABLE_COLUMNS: u64 = 11;
+pub const SERVER_PROFILE_EVENTS: u64 = 14;

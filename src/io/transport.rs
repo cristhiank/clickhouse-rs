@@ -331,7 +331,10 @@ impl PacketStream {
                 Ok(Packet::Eof(inner)) => h = Some(inner),
                 Ok(Packet::Block(block)) => b = Some(block),
                 Ok(Packet::Exception(e)) => return Err(Error::Server(e)),
-                Ok(Packet::TableColumns(_)) => (),
+                Ok(Packet::ProfileEvents(_))
+                | Ok(Packet::ProfileInfo(_))
+                | Ok(Packet::Progress(_))
+                | Ok(Packet::TableColumns(_)) => (),
                 Err(e) => return Err(Error::Io(e)),
                 _ => return Err(Error::Driver(DriverError::UnexpectedPacket)),
             }
