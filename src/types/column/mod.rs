@@ -178,7 +178,12 @@ impl<K: ColumnType> Column<K> {
 }
 
 impl<K: ColumnType> Column<K> {
-    pub(crate) fn read<R: ReadEx>(reader: &mut R, size: usize, tz: Tz, server_revision: u64) -> Result<Column<K>> {
+    pub(crate) fn read<R: ReadEx>(
+        reader: &mut R,
+        size: usize,
+        tz: Tz,
+        server_revision: u64,
+    ) -> Result<Column<K>> {
         let name = reader.read_string()?;
         let type_name = reader.read_string()?;
         if server_revision >= crate::binary::protocol::DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION {

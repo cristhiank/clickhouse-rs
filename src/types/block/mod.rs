@@ -156,7 +156,12 @@ impl Block {
         }
     }
 
-    pub(crate) fn load<R>(reader: &mut R, tz: Tz, compress: bool, server_revision: u64) -> Result<Self>
+    pub(crate) fn load<R>(
+        reader: &mut R,
+        tz: Tz,
+        compress: bool,
+        server_revision: u64,
+    ) -> Result<Self>
     where
         R: Read + ReadEx,
     {
@@ -628,10 +633,7 @@ mod test {
         // "UInt8" as a length-prefixed string: [0x05, b'U', b'i', b'n', b't', b'8', 0x00].
         // Find it and set the trailing 0x00 to 0x01.
         let type_str = b"\x05UInt8";
-        if let Some(pos) = bytes
-            .windows(type_str.len())
-            .position(|w| w == type_str)
-        {
+        if let Some(pos) = bytes.windows(type_str.len()).position(|w| w == type_str) {
             let marker_pos = pos + type_str.len();
             if marker_pos < bytes.len() {
                 bytes[marker_pos] = 0x01;

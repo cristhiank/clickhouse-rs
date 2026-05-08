@@ -81,9 +81,7 @@ fn encode_query(query: &Query, context: &Context) -> Result<Vec<u8>> {
     let server_revision = context.server_info.revision;
 
     // Query parameters require server revision >= DBMS_MIN_REVISION_WITH_PARAMETERS.
-    if query.has_parameters()
-        && server_revision < protocol::DBMS_MIN_REVISION_WITH_PARAMETERS
-    {
+    if query.has_parameters() && server_revision < protocol::DBMS_MIN_REVISION_WITH_PARAMETERS {
         return Err(Error::Driver(DriverError::QueryParametersUnsupported {
             server_revision,
             required_revision: protocol::DBMS_MIN_REVISION_WITH_PARAMETERS,
@@ -359,7 +357,10 @@ mod tests {
              got 0x{:02x} — if this is 0x02 the secret was placed before settings (bug)",
             bytes[pos + 19]
         );
-        assert_eq!(bytes[pos + 20], 0x02, "STATE_COMPLETE must follow interserver-secret");
+        assert_eq!(
+            bytes[pos + 20],
+            0x02,
+            "STATE_COMPLETE must follow interserver-secret"
+        );
     }
 }
-

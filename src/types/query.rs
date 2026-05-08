@@ -66,9 +66,7 @@ macro_rules! impl_from_display {
     };
 }
 
-impl_from_display!(
-    bool, i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, f32, f64
-);
+impl_from_display!(bool, i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, f32, f64);
 
 impl From<&str> for QueryParameterValue {
     fn from(s: &str) -> Self {
@@ -143,9 +141,7 @@ impl Query {
     ) -> Result<Self> {
         let name = name.as_ref().to_owned();
         if !validate_parameter_name(&name) {
-            return Err(Error::Driver(DriverError::InvalidParameterName {
-                name,
-            }));
+            return Err(Error::Driver(DriverError::InvalidParameterName { name }));
         }
         self.parameters.push((name, value.into()));
         Ok(self)
@@ -204,12 +200,12 @@ mod tests {
     fn test_validate_parameter_name_invalid() {
         assert!(!validate_parameter_name(""));
         assert!(!validate_parameter_name("param_foo")); // reserved prefix
-        assert!(!validate_parameter_name("1foo"));      // digit start
-        assert!(!validate_parameter_name("foo.bar"));   // dot
-        assert!(!validate_parameter_name("foo bar"));   // space
-        assert!(!validate_parameter_name("foo{bar}"));  // braces
-        assert!(!validate_parameter_name("foo:bar"));   // colon
-        assert!(!validate_parameter_name("fooé"));      // non-ASCII
+        assert!(!validate_parameter_name("1foo")); // digit start
+        assert!(!validate_parameter_name("foo.bar")); // dot
+        assert!(!validate_parameter_name("foo bar")); // space
+        assert!(!validate_parameter_name("foo{bar}")); // braces
+        assert!(!validate_parameter_name("foo:bar")); // colon
+        assert!(!validate_parameter_name("fooé")); // non-ASCII
     }
 
     #[test]

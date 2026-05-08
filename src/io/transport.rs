@@ -240,7 +240,10 @@ impl ClickhouseTransport {
     }
 
     pub(crate) fn push_raw_bytes(&mut self, bytes: Vec<u8>) {
-        debug_assert!(self.wr_is_empty(), "push_raw_bytes called with non-empty write buffer");
+        debug_assert!(
+            self.wr_is_empty(),
+            "push_raw_bytes called with non-empty write buffer"
+        );
         self.wr = Cursor::new(bytes);
     }
 
