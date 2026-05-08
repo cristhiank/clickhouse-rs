@@ -128,10 +128,6 @@ fn encode_query(query: &Query, context: &Context) -> Result<Vec<u8>> {
         encoder.uvarint(0); // parallel_replica_min_number_of_rows
     }
 
-    if server_revision >= protocol::DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET {
-        encoder.string(""); // interserver_secret
-    }
-
     let options = context.options.get()?;
 
     let settings_format =
@@ -142,6 +138,11 @@ fn encode_query(query: &Query, context: &Context) -> Result<Vec<u8>> {
         };
 
     serialize_settings(&mut encoder, &options, settings_format);
+
+    // Interserver secret comes AFTER settings, before stage.
+    if server_revision >= protocol::DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET {
+        encoder.string(""); // interserver_secret
+    }
 
     encoder.uvarint(protocol::STATE_COMPLETE);
 
@@ -219,7 +220,7 @@ mod tests {
     use crate::{
         binary::Encoder,
         errors::DriverError,
-        types::{query::QueryParameterValue, OptionsSource, ServerInfo},
+        types::{query::QueryParameterValue, IntoOptions, Options, OptionsSource, ServerInfo},
     };
 
     fn make_context(revision: u64) -> Context {
@@ -310,6 +311,55 @@ mod tests {
         // after the SQL string. The exact position is hard to pinpoint, but the packet must
         // be longer than with revision 0 (which would not include the extra fields).
         assert!(!bytes.is_empty());
+    }
+
+    /// Verify that the settings block is serialized BEFORE the interserver-secret marker and
+    /// not after. Revision 54441 enables both interserver-secret (54441) and Strings settings
+    /// format (54429). With a single custom setting, the wire layout after the setting name is:
+    ///   [is_important][value_varint][value_bytes][settings_terminator=0x00]
+    ///   [interserver_secret=0x00][STATE_COMPLETE=0x02]
+    /// If the secret were written before settings (old buggy order) the byte at offset +19
+    /// after the setting name would be STATE_COMPLETE (0x02), not 0x00.
+    #[test]
+    fn test_encode_query_settings_before_interserver_secret() {
+        let options = Options::default().with_setting("zz_order_test", "xyz", false);
+        let mut info = ServerInfo::default();
+        info.revision = 54441;
+        let ctx = Context {
+            options: options.into_options_src(),
+            hostname: "localhost".to_string(),
+            server_info: info,
+        };
+        let query = Query::new("SELECT 1");
+        let bytes = encode_query(&query, &ctx).expect("encode must succeed at revision 54441");
+
+        // Locate the setting name bytes in the packet.
+        let name = b"zz_order_test"; // len = 13
+        let pos = bytes
+            .windows(name.len())
+            .position(|w| w == name)
+            .expect("setting name 'zz_order_test' must appear in encoded packet");
+
+        // After the 13-byte name, in Strings format:
+        //   +0  is_important flag  : 0x00  (false)
+        //   +1  value len varint   : 0x03  ("xyz" = 3 bytes)
+        //   +2..+4  value bytes    : b"xyz"
+        //   +5  settings terminator: 0x00
+        // Then the correct post-settings bytes:
+        //   +6  interserver-secret : 0x00  (empty string varint)
+        //   +7  STATE_COMPLETE     : 0x02
+        assert_eq!(bytes[pos + 13], 0x00, "is_important flag");
+        assert_eq!(bytes[pos + 14], 0x03, "value length varint for 'xyz'");
+        assert_eq!(&bytes[pos + 15..pos + 18], b"xyz", "value bytes");
+        assert_eq!(bytes[pos + 18], 0x00, "settings terminator");
+        assert_eq!(
+            bytes[pos + 19],
+            0x00,
+            "interserver-secret (0x00) must follow settings; \
+             got 0x{:02x} — if this is 0x02 the secret was placed before settings (bug)",
+            bytes[pos + 19]
+        );
+        assert_eq!(bytes[pos + 20], 0x02, "STATE_COMPLETE must follow interserver-secret");
     }
 }
 
