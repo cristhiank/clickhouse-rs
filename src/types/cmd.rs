@@ -260,6 +260,26 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_query_params_array_literal_is_quoted_setting_value() {
+        // Query parameters are transported as setting strings. For an Array(String)
+        // placeholder the raw value must be the inner ClickHouse array literal; this
+        // serializer then adds the required outer string quotes for the setting value.
+        let params = vec![(
+            "array_param".to_owned(),
+            QueryParameterValue::from("['Engineering','Branding']"),
+        )];
+        let bytes = params_bytes(&params);
+        let expected_value = b"'[\\'Engineering\\',\\'Branding\\']'";
+
+        assert!(
+            bytes
+                .windows(expected_value.len())
+                .any(|w| w == expected_value),
+            "serialized packet must contain the escaped array literal setting value"
+        );
+    }
+
+    #[test]
     fn test_encode_query_old_server_no_params_succeeds() {
         let ctx = make_context(54400);
         let query = Query::new("SELECT 1");

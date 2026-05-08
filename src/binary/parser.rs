@@ -67,6 +67,8 @@ impl<'i, T: Read> Parser<'i, T> {
             None => Err(Error::Driver(DriverError::UnexpectedPacket)),
             Some(tz) => {
                 self.reader.skip_string()?;
+                // SERVER_PROFILE_EVENTS is encoded as a data block, but the native protocol
+                // sends it uncompressed even when the connection uses compressed data blocks.
                 let block = Block::load(&mut self.reader, tz, false, self.info.revision)?;
                 Ok(Packet::ProfileEvents(block))
             }
