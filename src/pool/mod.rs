@@ -199,11 +199,27 @@ impl Pool {
     }
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<ClientHandle>> {
-        self.handle_futures(cx)?;
+        let handle_futures_result = self.handle_futures(cx);
+        let pool_info = if handle_futures_result.is_err() {
+            Some(self.info())
+        } else {
+            None
+        };
 
         match self.take_conn() {
-            Some(client) => Poll::Ready(Ok(client)),
+            Some(client) => {
+                if let Err(err) = handle_futures_result {
+                    warn!(
+                        "Pending ClickHouse connection failed while idle connections were available; using idle connection instead. error={}; pool_info={:?}",
+                        err,
+                        pool_info.unwrap_or_else(|| self.info())
+                    );
+                }
+                Poll::Ready(Ok(client))
+            }
             None => {
+                handle_futures_result?;
+
                 let new_conn_created = {
                     let conn_count = self.inner.conn_count();
 
@@ -395,15 +411,43 @@ impl Drop for ClientHandle {
 mod test {
     use std::{
         str::FromStr,
+        sync::atomic::AtomicBool,
         time::{Duration, Instant},
     };
 
     use futures_util::future;
 
-    use crate::{errors::Result, test_misc::DATABASE_URL, Block, Options};
+    use crate::{
+        errors::{DriverError, Error, Result},
+        io::{ClickhouseTransport, Stream},
+        test_misc::DATABASE_URL,
+        types::Context as ClientContext,
+        Block, ClientHandle, Options,
+    };
 
-    use super::Pool;
+    use super::{Pool, PoolBinding};
     use url::Url;
+
+    async fn synthetic_idle_client(pool: &Pool) -> ClientHandle {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        accept.await.unwrap();
+
+        ClientHandle {
+            inner: Some(ClickhouseTransport::new(
+                Stream::from(stream),
+                false,
+                Some(pool.clone()),
+            )),
+            context: ClientContext::default(),
+            pool: PoolBinding::Detached(pool.clone()),
+            used: AtomicBool::new(false),
+        }
+    }
 
     #[tokio::test]
     async fn test_connect() -> Result<()> {
@@ -521,5 +565,31 @@ mod test {
         assert_eq!(pool.get_addr(), &Url::from_str("tcp://host2:9000").unwrap());
         assert_eq!(pool.get_addr(), &Url::from_str("tcp://host3:9000").unwrap());
         assert_eq!(pool.get_addr(), &Url::from_str("tcp://host1:9000").unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_get_handle_returns_idle_when_pending_connection_fails() -> Result<()> {
+        let pool = Pool::new(Options::default());
+        pool.inner
+            .idle
+            .push(synthetic_idle_client(&pool).await)
+            .unwrap();
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(future::ready(Err(Error::Driver(
+                DriverError::Timeout,
+            )))))
+            .is_ok());
+
+        let handle = pool.get_handle().await?;
+
+        let info = pool.info();
+        assert_eq!(info.new_len, 0);
+        assert_eq!(info.idle_len, 0);
+        assert_eq!(info.ongoing, 1);
+        drop(handle);
+        assert_eq!(pool.info().ongoing, 0);
+        Ok(())
     }
 }
