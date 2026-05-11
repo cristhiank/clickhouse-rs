@@ -9,7 +9,7 @@ use chrono_tz::Tz;
 
 use crate::{
     binary::{Encoder, ReadEx},
-    errors::{Error, FromSqlError, Result},
+    errors::{DriverError, Error, FromSqlError, Result},
     types::{
         column::{
             column_data::ArcColumnData,
@@ -178,9 +178,20 @@ impl<K: ColumnType> Column<K> {
 }
 
 impl<K: ColumnType> Column<K> {
-    pub(crate) fn read<R: ReadEx>(reader: &mut R, size: usize, tz: Tz) -> Result<Column<K>> {
+    pub(crate) fn read<R: ReadEx>(
+        reader: &mut R,
+        size: usize,
+        tz: Tz,
+        server_revision: u64,
+    ) -> Result<Column<K>> {
         let name = reader.read_string()?;
         let type_name = reader.read_string()?;
+        if server_revision >= crate::binary::protocol::DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION {
+            let marker: u8 = reader.read_scalar()?;
+            if marker != 0 {
+                return Err(Error::Driver(DriverError::UnsupportedCustomSerialization));
+            }
+        }
         let data =
             <dyn ColumnData>::load_data::<ArcColumnWrapper, _>(reader, &type_name, size, tz)?;
         let column = Self {
@@ -211,9 +222,12 @@ impl<K: ColumnType> Column<K> {
         self.data.at(index)
     }
 
-    pub(crate) fn write(&self, encoder: &mut Encoder) {
+    pub(crate) fn write(&self, encoder: &mut Encoder, server_revision: u64) {
         encoder.string(&self.name);
         encoder.string(self.data.sql_type().to_string().as_ref());
+        if server_revision >= crate::binary::protocol::DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION {
+            encoder.write(0_u8);
+        }
         let len = self.data.len();
         self.data.save(encoder, 0, len);
     }

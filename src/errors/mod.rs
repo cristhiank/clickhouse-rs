@@ -107,6 +107,22 @@ pub enum DriverError {
 
     #[error("Deserialize error: `{}`", _0)]
     Deserialize(Cow<'static, str>),
+
+    #[error("Invalid query parameter name: `{}`.", name)]
+    InvalidParameterName { name: String },
+
+    #[error(
+        "Server revision {} does not support query parameters (requires >= {}).",
+        server_revision,
+        required_revision
+    )]
+    QueryParametersUnsupported {
+        server_revision: u64,
+        required_revision: u64,
+    },
+
+    #[error("Server sent unsupported custom serialization marker (nonzero byte).")]
+    UnsupportedCustomSerialization,
 }
 
 /// This type enumerates cast from sql type errors.

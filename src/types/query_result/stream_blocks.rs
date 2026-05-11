@@ -123,7 +123,7 @@ impl<'a> Stream for BlockStream<'a> {
                         self.name, self.block_index
                     );
                 }
-                Packet::ProfileInfo(_) | Packet::Progress(_) => {}
+                Packet::ProfileEvents(_) | Packet::ProfileInfo(_) | Packet::Progress(_) => {}
                 Packet::Exception(exception) => {
                     self.state = BlockStreamState::Finished;
 

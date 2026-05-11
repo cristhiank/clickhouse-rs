@@ -239,6 +239,27 @@ impl ClickhouseTransport {
         }
     }
 
+    pub(crate) fn push_raw_bytes(&mut self, bytes: Vec<u8>) {
+        debug_assert!(
+            self.wr_is_empty(),
+            "push_raw_bytes called with non-empty write buffer"
+        );
+        self.wr = Cursor::new(bytes);
+    }
+
+    pub(crate) fn poll_flush_wr(&mut self, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            if self.wr_is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            match self.wr_flush(cx) {
+                Ok(true) => {} // some bytes written; continue
+                Ok(false) => return Poll::Pending,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+
     fn send(&mut self, cx: &mut task::Context) -> Poll<Result<()>> {
         loop {
             if self.wr_is_empty() {
@@ -313,7 +334,10 @@ impl PacketStream {
                 Ok(Packet::Eof(inner)) => h = Some(inner),
                 Ok(Packet::Block(block)) => b = Some(block),
                 Ok(Packet::Exception(e)) => return Err(Error::Server(e)),
-                Ok(Packet::TableColumns(_)) => (),
+                Ok(Packet::ProfileEvents(_))
+                | Ok(Packet::ProfileInfo(_))
+                | Ok(Packet::Progress(_))
+                | Ok(Packet::TableColumns(_)) => (),
                 Err(e) => return Err(Error::Io(e)),
                 _ => return Err(Error::Driver(DriverError::UnexpectedPacket)),
             }

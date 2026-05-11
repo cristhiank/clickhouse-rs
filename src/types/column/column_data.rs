@@ -50,8 +50,6 @@ pub trait ColumnData {
     }
 }
 
-/*
-
 pub(crate) trait ColumnDataExt {
     fn append<T: Into<Value>>(&mut self, value: T);
 }
@@ -61,5 +59,3 @@ impl<C: ColumnData> ColumnDataExt for C {
         self.push(value.into());
     }
 }
-
-*/

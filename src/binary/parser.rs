@@ -44,6 +44,7 @@ impl<'i, T: Read> Parser<'i, T> {
             protocol::SERVER_DATA | protocol::SERVER_TOTALS | protocol::SERVER_EXTREMES => {
                 Ok(self.parse_block()?)
             }
+            protocol::SERVER_PROFILE_EVENTS => Ok(self.parse_profile_events()?),
             protocol::SERVER_END_OF_STREAM => Ok(Packet::Eof(())),
             _ => Err(Error::Driver(DriverError::UnknownPacket { packet })),
         }
@@ -54,8 +55,22 @@ impl<'i, T: Read> Parser<'i, T> {
             None => Err(Error::Driver(DriverError::UnexpectedPacket)),
             Some(tz) => {
                 self.reader.skip_string()?;
-                let block = Block::load(&mut self.reader, tz, self.info.compress)?;
+                let block =
+                    Block::load(&mut self.reader, tz, self.info.compress, self.info.revision)?;
                 Ok(Packet::Block(block))
+            }
+        }
+    }
+
+    fn parse_profile_events(&mut self) -> Result<Packet<()>> {
+        match self.info.timezone {
+            None => Err(Error::Driver(DriverError::UnexpectedPacket)),
+            Some(tz) => {
+                self.reader.skip_string()?;
+                // SERVER_PROFILE_EVENTS is encoded as a data block, but the native protocol
+                // sends it uncompressed even when the connection uses compressed data blocks.
+                let block = Block::load(&mut self.reader, tz, false, self.info.revision)?;
+                Ok(Packet::ProfileEvents(block))
             }
         }
     }
@@ -177,5 +192,39 @@ impl<'i, T: Read> Parser<'i, T> {
     fn parse_pong(&self) -> Packet<()> {
         trace!("[process]      <- pong");
         Packet::Pong(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::{binary::Encoder, types::Simple};
+
+    #[test]
+    fn parse_profile_events_uses_uncompressed_block() {
+        let revision = protocol::DBMS_MIN_REVISION_WITH_PARAMETERS;
+        let mut encoder = Encoder::new();
+        encoder.uvarint(protocol::SERVER_PROFILE_EVENTS);
+        encoder.string("");
+        Block::<Simple>::default().write(&mut encoder, false, revision);
+
+        let info = TransportInfo {
+            timezone: Some(Tz::UTC),
+            revision,
+            compress: true,
+        };
+        let bytes = encoder.get_buffer();
+        let mut cursor = Cursor::new(&bytes);
+        let mut parser = Parser::new(&mut cursor, &info);
+
+        match parser
+            .parse_packet(revision)
+            .expect("profile events packet should parse")
+        {
+            Packet::ProfileEvents(block) => assert!(block.is_empty()),
+            other => panic!("expected profile events packet, got {other:?}"),
+        }
     }
 }
