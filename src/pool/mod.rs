@@ -26,11 +26,14 @@ use url::Url;
 
 mod futures;
 
+const PENDING_OPEN_POLL_BUDGET: usize = 4;
+
 pub(crate) struct Inner {
     new: crossbeam::queue::ArrayQueue<BoxFuture<'static, Result<ClientHandle>>>,
     idle: crossbeam::queue::ArrayQueue<ClientHandle>,
     tasks: crossbeam::queue::SegQueue<Waker>,
     ongoing: atomic::AtomicUsize,
+    conn_slots: atomic::AtomicUsize,
     hosts: Vec<Url>,
     connections_num: atomic::AtomicUsize,
 }
@@ -42,16 +45,48 @@ impl Inner {
             return;
         }
         self.ongoing.fetch_sub(1, Ordering::AcqRel);
-        while let Some(task) = self.tasks.pop() {
-            task.wake()
-        }
+        self.release_conn_slot();
+        self.wake_tasks();
     }
 
     fn conn_count(&self) -> usize {
-        let is_new_some = self.new.len();
-        let ongoing = self.ongoing.load(Ordering::Acquire);
-        let idle_count = self.idle.len();
-        is_new_some + idle_count + ongoing
+        self.conn_slots.load(Ordering::Acquire)
+    }
+
+    fn try_reserve_conn(&self, max: usize) -> bool {
+        let mut current = self.conn_count();
+
+        while current < max {
+            match self.conn_slots.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+
+        false
+    }
+
+    fn release_conn_slot(&self) {
+        if self
+            .conn_slots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_err()
+        {
+            warn!("release_conn_slot called when no connections are reserved");
+        }
+    }
+
+    fn wake_tasks(&self) {
+        while let Some(task) = self.tasks.pop() {
+            task.wake()
+        }
     }
 }
 
@@ -168,10 +203,11 @@ impl Pool {
         }
 
         let inner = Arc::new(Inner {
-            new: crossbeam::queue::ArrayQueue::new(1),
+            new: crossbeam::queue::ArrayQueue::new(max),
             idle: crossbeam::queue::ArrayQueue::new(max),
             tasks: crossbeam::queue::SegQueue::new(),
             ongoing: atomic::AtomicUsize::new(0),
+            conn_slots: atomic::AtomicUsize::new(0),
             connections_num: atomic::AtomicUsize::new(0),
             hosts,
         });
@@ -206,37 +242,31 @@ impl Pool {
             None
         };
 
-        match self.take_conn() {
-            Some(client) => {
-                if let Err(err) = handle_futures_result {
-                    warn!(
-                        "Pending ClickHouse connection failed while idle connections were available; using idle connection instead. error={}; pool_info={:?}",
-                        err,
-                        pool_info.unwrap_or_else(|| self.info())
-                    );
-                }
-                Poll::Ready(Ok(client))
+        if let Some(client) = self.take_conn() {
+            if let Err(err) = handle_futures_result {
+                warn!(
+                    "Pending ClickHouse connection failed while idle connections were available; using idle connection instead. error={}; pool_info={:?}",
+                    err,
+                    pool_info.unwrap_or_else(|| self.info())
+                );
             }
-            None => {
-                handle_futures_result?;
+            return Poll::Ready(Ok(client));
+        }
 
-                let new_conn_created = {
-                    let conn_count = self.inner.conn_count();
+        handle_futures_result?;
 
-                    if conn_count < self.max && self.inner.new.push(self.new_connection()).is_ok() {
-                        true
-                    } else {
-                        self.inner.tasks.push(cx.waker().clone());
-                        false
-                    }
-                };
-                if new_conn_created {
-                    self.poll(cx)
-                } else {
-                    Poll::Pending
+        if self.inner.try_reserve_conn(self.max) {
+            match self.inner.new.push(self.new_connection()) {
+                Ok(()) => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
+                Err(_) => self.inner.release_conn_slot(),
             }
         }
+
+        self.inner.tasks.push(cx.waker().clone());
+        Poll::Pending
     }
 
     fn new_connection(&self) -> BoxFuture<'static, Result<ClientHandle>> {
@@ -318,24 +348,55 @@ impl Pool {
     }
 
     fn handle_futures(&mut self, cx: &mut Context<'_>) -> Result<()> {
-        if let Some(mut new) = self.inner.new.pop() {
+        let len = self.inner.new.len().min(PENDING_OPEN_POLL_BUDGET);
+        let mut first_err = None;
+        let mut wake_waiters = false;
+
+        for _ in 0..len {
+            let Some(mut new) = self.inner.new.pop() else {
+                break;
+            };
+
             match new.poll_unpin(cx) {
                 Poll::Ready(Ok(client)) => {
-                    self.inner.idle.push(client).unwrap();
+                    if self.inner.idle.push(client).is_err() {
+                        self.inner.release_conn_slot();
+                        warn!(
+                            "Ready ClickHouse connection could not be added to idle pool; closing it. pool_info={:?}",
+                            self.info()
+                        );
+                    }
+                    wake_waiters = true;
                 }
                 Poll::Pending => {
-                    // NOTE: it is okay to drop the construction task
-                    // because another construction will be attempted
-                    // later in Pool::poll
-                    let _ = self.inner.new.push(new);
+                    if self.inner.new.push(new).is_err() {
+                        self.inner.release_conn_slot();
+                        wake_waiters = true;
+                    }
                 }
                 Poll::Ready(Err(err)) => {
-                    return Err(err);
+                    self.inner.release_conn_slot();
+                    wake_waiters = true;
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    } else {
+                        warn!(
+                            "Additional pending ClickHouse connection failed while another pending connection error is being returned. error={}",
+                            err
+                        );
+                    }
                 }
             }
         }
 
-        Ok(())
+        if wake_waiters {
+            self.inner.wake_tasks();
+        }
+
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     fn take_conn(&mut self) -> Option<ClientHandle> {
@@ -357,20 +418,35 @@ impl Pool {
         client.pool = PoolBinding::None;
         client.set_inside(true);
 
-        if self.inner.idle.len() < min && is_attached && client.inner.is_some() {
-            let _ = self.inner.idle.push(client);
-        }
-
         if self.inner.ongoing.load(Ordering::Acquire) == 0 {
             warn!("return_conn called when no connections are ongoing");
             return;
         }
 
-        self.inner.ongoing.fetch_sub(1, Ordering::AcqRel);
+        let returned_to_idle = if self.inner.idle.len() < min
+            && is_attached
+            && client.inner.is_some()
+        {
+            match self.inner.idle.push(client) {
+                Ok(()) => true,
+                Err(_) => {
+                    warn!(
+                        "Returned ClickHouse connection could not be added to idle pool; closing it. pool_info={:?}",
+                        self.info()
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
 
-        while let Some(task) = self.inner.tasks.pop() {
-            task.wake()
+        self.inner.ongoing.fetch_sub(1, Ordering::AcqRel);
+        if !returned_to_idle {
+            self.inner.release_conn_slot();
         }
+
+        self.inner.wake_tasks();
     }
 
     pub(crate) fn get_addr(&self) -> &Url {
@@ -410,8 +486,13 @@ impl Drop for ClientHandle {
 #[cfg(test)]
 mod test {
     use std::{
+        future::Future,
         str::FromStr,
-        sync::atomic::AtomicBool,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+        task::{Context, Poll, Wake, Waker},
         time::{Duration, Instant},
     };
 
@@ -427,6 +508,33 @@ mod test {
 
     use super::{Pool, PoolBinding};
     use url::Url;
+
+    struct CountWake {
+        wakes: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct CountingPending {
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl Future for CountingPending {
+        type Output = Result<ClientHandle>;
+
+        fn poll(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
 
     async fn synthetic_idle_client(pool: &Pool) -> ClientHandle {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -447,6 +555,15 @@ mod test {
             pool: PoolBinding::Detached(pool.clone()),
             used: AtomicBool::new(false),
         }
+    }
+
+    fn reserve_conn(pool: &Pool) {
+        assert!(pool.inner.try_reserve_conn(pool.max));
+    }
+
+    fn count_waker() -> (Arc<AtomicUsize>, Waker) {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        (wakes.clone(), Waker::from(Arc::new(CountWake { wakes })))
     }
 
     #[tokio::test]
@@ -568,12 +685,240 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_get_handle_returns_idle_when_pending_connection_fails() -> Result<()> {
-        let pool = Pool::new(Options::default());
+    async fn test_get_handle_starts_pending_connections_up_to_pool_max() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+
+        let pool_max = 4;
+        let options = Options::from_str(&format!("tcp://{}", addr))
+            .unwrap()
+            .pool_min(0)
+            .pool_max(pool_max)
+            .connection_timeout(Duration::from_secs(30));
+        let pool = Pool::new(options);
+        let mut handles: Vec<_> = (0..pool_max).map(|_| Box::pin(pool.get_handle())).collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            future::poll_fn(|cx| {
+                for handle in &mut handles {
+                    let _ = handle.as_mut().poll(cx);
+                }
+
+                if pool.info().new_len == pool_max {
+                    Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(pool.info().new_len, pool_max);
+        accept.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_handle_bounds_pending_open_polling_during_cold_burst() -> Result<()> {
+        let pool_max = 16;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+        let polls = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..pool_max {
+            reserve_conn(&pool);
+            assert!(pool
+                .inner
+                .new
+                .push(Box::pin(CountingPending {
+                    polls: polls.clone(),
+                }))
+                .is_ok());
+        }
+
+        let (_, waker) = count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut waiters: Vec<_> = (0..pool_max).map(|_| Box::pin(pool.get_handle())).collect();
+
+        for waiter in &mut waiters {
+            assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+        }
+
+        let poll_count = polls.load(Ordering::SeqCst);
+        assert_eq!(pool.info().new_len, pool_max);
+        assert!(poll_count <= pool_max * super::PENDING_OPEN_POLL_BUDGET);
+        assert!(poll_count < pool_max * pool_max);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_completed_pending_open_wakes_parked_waiter() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
+        reserve_conn(&pool);
+        assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake {
+            wakes: wakes.clone(),
+        }));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = Box::pin(pool.get_handle());
+
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(pool.info().tasks_len, 1);
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+
+        let _ = pool.inner.new.pop();
+        let client = synthetic_idle_client(&pool).await;
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(future::ready(Ok(client))))
+            .is_ok());
+
+        let mut driver = pool.clone();
+        driver.handle_futures(&mut cx)?;
+
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        let handle = match waiter.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(handle)) => handle,
+            _ => panic!("waiter did not acquire the completed pending connection"),
+        };
+        assert_eq!(pool.info().ongoing, 1);
+        drop(handle);
+        assert_eq!(pool.info().ongoing, 0);
+        assert_eq!(pool.inner.conn_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_failure_wakes_live_waiter_after_stale_waiter() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
+        reserve_conn(&pool);
+        assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+
+        let (stale_wakes, stale_waker) = count_waker();
+        let mut stale_cx = Context::from_waker(&stale_waker);
+        let mut stale_waiter = Box::pin(pool.get_handle());
+        assert!(matches!(
+            stale_waiter.as_mut().poll(&mut stale_cx),
+            Poll::Pending
+        ));
+        drop(stale_waiter);
+
+        let (live_wakes, live_waker) = count_waker();
+        let mut live_cx = Context::from_waker(&live_waker);
+        let mut live_waiter = Box::pin(pool.get_handle());
+        assert!(matches!(
+            live_waiter.as_mut().poll(&mut live_cx),
+            Poll::Pending
+        ));
+        assert_eq!(pool.info().tasks_len, 2);
+
+        assert!(pool.inner.new.pop().is_some());
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(future::ready(Err(Error::Driver(
+                DriverError::Timeout,
+            )))))
+            .is_ok());
+
+        let mut driver = pool.clone();
+        assert!(driver.handle_futures(&mut live_cx).is_err());
+
+        assert_eq!(stale_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(live_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.info().tasks_len, 0);
+        assert_eq!(pool.inner.conn_count(), 0);
+        drop(live_waiter);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_open_wakes_parked_waiter() -> Result<()> {
+        let pool_max = 2;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+        for _ in 0..pool_max {
+            reserve_conn(&pool);
+            assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        }
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake {
+            wakes: wakes.clone(),
+        }));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiters: Vec<_> = (0..pool_max).map(|_| Box::pin(pool.get_handle())).collect();
+
+        for waiter in &mut waiters {
+            assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+        }
+        assert_eq!(pool.info().tasks_len, pool_max);
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+
+        for _ in 0..pool_max {
+            assert!(pool.inner.new.pop().is_some());
+        }
+        for _ in 0..pool_max {
+            assert!(pool
+                .inner
+                .new
+                .push(Box::pin(future::ready(Err(Error::Driver(
+                    DriverError::Timeout,
+                )))))
+                .is_ok());
+        }
+
+        let mut driver = pool.clone();
+        assert!(driver.handle_futures(&mut cx).is_err());
+
+        assert_eq!(wakes.load(Ordering::SeqCst), pool_max);
+        assert_eq!(pool.info().tasks_len, 0);
+        assert_eq!(pool.info().new_len, 0);
+        assert_eq!(pool.inner.conn_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_returned_to_idle_retains_conn_slot_when_pool_min_keeps_idle() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(1).pool_max(2));
+        reserve_conn(&pool);
         pool.inner
             .idle
             .push(synthetic_idle_client(&pool).await)
             .unwrap();
+
+        let handle = pool.get_handle().await?;
+        assert_eq!(pool.info().idle_len, 0);
+        assert_eq!(pool.info().ongoing, 1);
+        assert_eq!(pool.inner.conn_count(), 1);
+
+        drop(handle);
+
+        assert_eq!(pool.info().ongoing, 0);
+        assert_eq!(pool.info().idle_len, 1);
+        assert_eq!(pool.inner.conn_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_handle_returns_idle_when_pending_connection_fails() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0));
+        reserve_conn(&pool);
+        pool.inner
+            .idle
+            .push(synthetic_idle_client(&pool).await)
+            .unwrap();
+        reserve_conn(&pool);
         assert!(pool
             .inner
             .new
@@ -588,8 +933,48 @@ mod test {
         assert_eq!(info.new_len, 0);
         assert_eq!(info.idle_len, 0);
         assert_eq!(info.ongoing, 1);
+        assert_eq!(pool.inner.conn_count(), 1);
         drop(handle);
         assert_eq!(pool.info().ongoing, 0);
+        assert_eq!(pool.inner.conn_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_futures_drops_ready_connection_when_idle_full() -> Result<()> {
+        let pool_max = 2;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+
+        for _ in 0..pool_max {
+            reserve_conn(&pool);
+            pool.inner
+                .idle
+                .push(synthetic_idle_client(&pool).await)
+                .unwrap();
+        }
+
+        pool.inner.conn_slots.fetch_add(1, Ordering::AcqRel);
+        let client = synthetic_idle_client(&pool).await;
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(future::ready(Ok(client))))
+            .is_ok());
+
+        let (wakes, waker) = count_waker();
+        pool.inner.tasks.push(waker.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut driver = pool.clone();
+
+        assert_eq!(pool.info().tasks_len, 1);
+        driver.handle_futures(&mut cx)?;
+
+        let info = pool.info();
+        assert_eq!(info.new_len, 0);
+        assert_eq!(info.idle_len, pool_max);
+        assert_eq!(info.tasks_len, 0);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.inner.conn_count(), pool_max);
         Ok(())
     }
 }
