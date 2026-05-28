@@ -5,9 +5,9 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{self, Ordering},
-        Arc,
+        Arc, Mutex, Weak,
     },
-    task::{Context, Poll, Waker},
+    task::{Context, Poll, Wake, Waker},
     time::Duration,
 };
 
@@ -28,12 +28,39 @@ mod futures;
 
 const PENDING_OPEN_POLL_BUDGET: usize = 4;
 
+struct PendingOpenWake {
+    inner: Weak<Inner>,
+}
+
+impl Wake for PendingOpenWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner
+                .pending_open_scan_needed
+                .store(true, Ordering::Release);
+            let driver_waker = inner.pending_open_scan_driver_waker.lock().unwrap().clone();
+            if let Some(waker) = driver_waker {
+                waker.wake();
+            } else {
+                inner.wake_tasks();
+            }
+        }
+    }
+}
+
 pub(crate) struct Inner {
     new: crossbeam::queue::ArrayQueue<BoxFuture<'static, Result<ClientHandle>>>,
     idle: crossbeam::queue::ArrayQueue<ClientHandle>,
     tasks: crossbeam::queue::SegQueue<Waker>,
     ongoing: atomic::AtomicUsize,
     conn_slots: atomic::AtomicUsize,
+    pending_open_scan_driver: atomic::AtomicBool,
+    pending_open_scan_driver_waker: Mutex<Option<Waker>>,
+    pending_open_scan_needed: Arc<atomic::AtomicBool>,
     hosts: Vec<Url>,
     connections_num: atomic::AtomicUsize,
 }
@@ -81,6 +108,34 @@ impl Inner {
         {
             warn!("release_conn_slot called when no connections are reserved");
         }
+    }
+
+    pub(crate) fn release_pending_open_scan_driver(&self) {
+        {
+            let mut driver_waker = self.pending_open_scan_driver_waker.lock().unwrap();
+            self.pending_open_scan_driver
+                .store(false, Ordering::Release);
+            *driver_waker = None;
+        }
+
+        if self.pending_open_scan_needed.load(Ordering::Acquire) {
+            self.wake_tasks();
+        }
+    }
+
+    pub(crate) fn handoff_pending_open_scan_driver(&self) {
+        self.pending_open_scan_needed.store(true, Ordering::Release);
+        self.release_pending_open_scan_driver();
+    }
+
+    fn try_acquire_pending_open_scan_driver(&self) -> bool {
+        self.pending_open_scan_driver
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn set_pending_open_scan_driver_waker(&self, waker: &Waker) {
+        *self.pending_open_scan_driver_waker.lock().unwrap() = Some(waker.clone());
     }
 
     fn wake_tasks(&self) {
@@ -208,6 +263,9 @@ impl Pool {
             tasks: crossbeam::queue::SegQueue::new(),
             ongoing: atomic::AtomicUsize::new(0),
             conn_slots: atomic::AtomicUsize::new(0),
+            pending_open_scan_driver: atomic::AtomicBool::new(false),
+            pending_open_scan_driver_waker: Mutex::new(None),
+            pending_open_scan_needed: Arc::new(atomic::AtomicBool::new(true)),
             connections_num: atomic::AtomicUsize::new(0),
             hosts,
         });
@@ -234,8 +292,29 @@ impl Pool {
         GetHandle::new(self)
     }
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<ClientHandle>> {
-        let handle_futures_result = self.handle_futures(cx);
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        scan_remaining: &mut usize,
+        scan_driver: &mut bool,
+    ) -> Poll<Result<ClientHandle>> {
+        if !*scan_driver
+            && self.inner.pending_open_scan_needed.load(Ordering::Acquire)
+            && self.inner.try_acquire_pending_open_scan_driver()
+        {
+            *scan_driver = true;
+        }
+        if *scan_driver {
+            self.inner.set_pending_open_scan_driver_waker(cx.waker());
+        }
+
+        let handle_futures_result = if *scan_driver {
+            self.handle_futures(cx, scan_remaining)
+        } else {
+            Ok(())
+        };
+
+        let scan_complete = *scan_driver && *scan_remaining == 0;
         let pool_info = if handle_futures_result.is_err() {
             Some(self.info())
         } else {
@@ -243,6 +322,14 @@ impl Pool {
         };
 
         if let Some(client) = self.take_conn() {
+            if *scan_driver {
+                if scan_complete {
+                    self.inner.release_pending_open_scan_driver();
+                } else {
+                    self.inner.handoff_pending_open_scan_driver();
+                }
+                *scan_driver = false;
+            }
             if let Err(err) = handle_futures_result {
                 warn!(
                     "Pending ClickHouse connection failed while idle connections were available; using idle connection instead. error={}; pool_info={:?}",
@@ -253,11 +340,20 @@ impl Pool {
             return Poll::Ready(Ok(client));
         }
 
-        handle_futures_result?;
+        if let Err(err) = handle_futures_result {
+            if scan_complete {
+                self.inner.release_pending_open_scan_driver();
+                *scan_driver = false;
+            }
+            return Poll::Ready(Err(err));
+        }
 
         if self.inner.try_reserve_conn(self.max) {
             match self.inner.new.push(self.new_connection()) {
                 Ok(()) => {
+                    self.inner
+                        .pending_open_scan_needed
+                        .store(true, Ordering::Release);
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
@@ -265,8 +361,35 @@ impl Pool {
             }
         }
 
-        self.inner.tasks.push(cx.waker().clone());
+        if scan_complete {
+            if self.inner.pending_open_scan_needed.load(Ordering::Acquire) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            self.inner.tasks.push(cx.waker().clone());
+            self.inner.release_pending_open_scan_driver();
+            *scan_driver = false;
+            return Poll::Pending;
+        }
+
+        if *scan_remaining == 0 {
+            self.park_pending_open_waiter(cx, scan_driver);
+        }
         Poll::Pending
+    }
+
+    fn park_pending_open_waiter(&self, cx: &mut Context<'_>, scan_driver: &mut bool) {
+        self.inner.tasks.push(cx.waker().clone());
+
+        if !*scan_driver
+            && self.inner.pending_open_scan_needed.load(Ordering::Acquire)
+            && self.inner.try_acquire_pending_open_scan_driver()
+        {
+            *scan_driver = true;
+            self.inner.set_pending_open_scan_driver_waker(cx.waker());
+            cx.waker().wake_by_ref();
+        }
     }
 
     fn new_connection(&self) -> BoxFuture<'static, Result<ClientHandle>> {
@@ -347,17 +470,43 @@ impl Pool {
         }
     }
 
-    fn handle_futures(&mut self, cx: &mut Context<'_>) -> Result<()> {
-        let len = self.inner.new.len().min(PENDING_OPEN_POLL_BUDGET);
+    fn handle_futures(&mut self, cx: &mut Context<'_>, scan_remaining: &mut usize) -> Result<()> {
+        // Begin a fresh scan cycle when the previous one has completed or was
+        // never started.  The cycle length is the queue depth at this moment;
+        // futures added after the cycle starts are left for the next cycle.
+        if *scan_remaining == 0 {
+            self.inner
+                .pending_open_scan_needed
+                .store(false, Ordering::Release);
+            *scan_remaining = self.inner.new.len();
+        } else {
+            *scan_remaining = (*scan_remaining).min(self.inner.new.len());
+        }
+
+        let to_poll = (*scan_remaining).min(PENDING_OPEN_POLL_BUDGET);
+        let pending_waker = Waker::from(Arc::new(PendingOpenWake {
+            inner: Arc::downgrade(&self.inner),
+        }));
+        let mut pending_cx = Context::from_waker(&pending_waker);
         let mut first_err = None;
         let mut wake_waiters = false;
+        let mut state_changed = false;
+        let mut polled = 0;
+        let mut queue_exhausted = false;
+        let cycle_remaining = *scan_remaining;
 
-        for _ in 0..len {
+        for _ in 0..to_poll {
             let Some(mut new) = self.inner.new.pop() else {
+                // Queue was drained by another driver between our cycle-start
+                // snapshot and this iteration.  Treat the cycle as complete so
+                // a stale scan_remaining does not trigger a self-wake on an
+                // empty queue.
+                queue_exhausted = true;
                 break;
             };
+            polled += 1;
 
-            match new.poll_unpin(cx) {
+            match new.poll_unpin(&mut pending_cx) {
                 Poll::Ready(Ok(client)) => {
                     if self.inner.idle.push(client).is_err() {
                         self.inner.release_conn_slot();
@@ -367,16 +516,19 @@ impl Pool {
                         );
                     }
                     wake_waiters = true;
+                    state_changed = true;
                 }
                 Poll::Pending => {
                     if self.inner.new.push(new).is_err() {
                         self.inner.release_conn_slot();
                         wake_waiters = true;
+                        state_changed = true;
                     }
                 }
                 Poll::Ready(Err(err)) => {
                     self.inner.release_conn_slot();
                     wake_waiters = true;
+                    state_changed = true;
                     if first_err.is_none() {
                         first_err = Some(err);
                     } else {
@@ -389,8 +541,43 @@ impl Pool {
             }
         }
 
+        let unscanned_in_cycle = polled < cycle_remaining && !queue_exhausted;
+
+        if state_changed || queue_exhausted {
+            // A connection resolved/dropped, or the queue was drained by
+            // another driver: reset so the next poll starts a fresh cycle.
+            // wake_tasks() (when state_changed) handles waiter continuation.
+            *scan_remaining = 0;
+            if queue_exhausted {
+                self.inner
+                    .pending_open_scan_needed
+                    .store(false, Ordering::Release);
+            } else if unscanned_in_cycle {
+                self.inner
+                    .pending_open_scan_needed
+                    .store(true, Ordering::Release);
+            }
+        } else {
+            *scan_remaining = scan_remaining.saturating_sub(polled);
+            if *scan_remaining == 0
+                && self
+                    .inner
+                    .pending_open_scan_needed
+                    .swap(false, Ordering::AcqRel)
+            {
+                // A pending-open future woke during this scan cycle. That wake
+                // may have been coalesced with our continuation wake, so run a
+                // fresh bounded cycle instead of parking and missing it.
+                *scan_remaining = self.inner.new.len();
+            }
+        }
+
         if wake_waiters {
             self.inner.wake_tasks();
+        } else if *scan_remaining > 0 {
+            // Budget exhausted mid-cycle with no state change: self-wake once
+            // so we continue scanning without requiring an external event.
+            cx.waker().wake_by_ref();
         }
 
         match first_err {
@@ -490,7 +677,7 @@ mod test {
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         task::{Context, Poll, Wake, Waker},
         time::{Duration, Instant},
@@ -533,6 +720,26 @@ mod test {
         fn poll(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
             self.polls.fetch_add(1, Ordering::SeqCst);
             Poll::Pending
+        }
+    }
+
+    struct ReadyAfterStoredWake {
+        client: Option<ClientHandle>,
+        polls: usize,
+        waker: Arc<Mutex<Option<Waker>>>,
+    }
+
+    impl Future for ReadyAfterStoredWake {
+        type Output = Result<ClientHandle>;
+
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.polls == 0 {
+                self.polls += 1;
+                *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(self.client.take().unwrap()))
+            }
         }
     }
 
@@ -785,7 +992,8 @@ mod test {
             .is_ok());
 
         let mut driver = pool.clone();
-        driver.handle_futures(&mut cx)?;
+        let mut scan = 0usize;
+        driver.handle_futures(&mut cx, &mut scan)?;
 
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
         let handle = match waiter.as_mut().poll(&mut cx) {
@@ -833,7 +1041,8 @@ mod test {
             .is_ok());
 
         let mut driver = pool.clone();
-        assert!(driver.handle_futures(&mut live_cx).is_err());
+        let mut scan = 0usize;
+        assert!(driver.handle_futures(&mut live_cx, &mut scan).is_err());
 
         assert_eq!(stale_wakes.load(Ordering::SeqCst), 1);
         assert_eq!(live_wakes.load(Ordering::SeqCst), 1);
@@ -879,7 +1088,8 @@ mod test {
         }
 
         let mut driver = pool.clone();
-        assert!(driver.handle_futures(&mut cx).is_err());
+        let mut scan = 0usize;
+        assert!(driver.handle_futures(&mut cx, &mut scan).is_err());
 
         assert_eq!(wakes.load(Ordering::SeqCst), pool_max);
         assert_eq!(pool.info().tasks_len, 0);
@@ -967,7 +1177,8 @@ mod test {
         let mut driver = pool.clone();
 
         assert_eq!(pool.info().tasks_len, 1);
-        driver.handle_futures(&mut cx)?;
+        let mut scan = 0usize;
+        driver.handle_futures(&mut cx, &mut scan)?;
 
         let info = pool.info();
         assert_eq!(info.new_len, 0);
@@ -975,6 +1186,625 @@ mod test {
         assert_eq!(info.tasks_len, 0);
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
         assert_eq!(pool.inner.conn_count(), pool_max);
+        Ok(())
+    }
+
+    /// GRD-C001: a ready future sitting beyond the first scan budget must be
+    /// observed without requiring an external event.  The waiter should be
+    /// served after at most ceil(N / BUDGET) self-woken polls.
+    #[tokio::test]
+    async fn test_ready_future_beyond_budget_is_eventually_observed() -> Result<()> {
+        let pool_max = super::PENDING_OPEN_POLL_BUDGET + 1;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+
+        // First BUDGET futures are permanently pending; the last one is ready.
+        for _ in 0..pool_max - 1 {
+            reserve_conn(&pool);
+            assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        }
+        reserve_conn(&pool);
+        let ready_client = synthetic_idle_client(&pool).await;
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(future::ready(Ok(ready_client))))
+            .is_ok());
+
+        let (wakes, waker) = count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = Box::pin(pool.get_handle());
+
+        // First poll: scans BUDGET futures (all pending), self-wakes once to
+        // continue the scan cycle.
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "expected exactly one self-wake to continue the scan cycle"
+        );
+        assert_eq!(
+            pool.info().tasks_len,
+            0,
+            "partial scan continuation should not also park the waiter"
+        );
+
+        // Second poll (continuation): scans the remaining 1 future which is
+        // ready; the connection is placed in idle and returned to the waiter.
+        let handle = match waiter.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(handle)) => handle,
+            _ => panic!("expected Ready(Ok(_)) on the continuation poll"),
+        };
+        assert_eq!(pool.info().ongoing, 1);
+        drop(handle);
+        assert_eq!(pool.info().ongoing, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ready_during_partial_scan_keeps_unscanned_futures_scannable() -> Result<()> {
+        let pool_max = super::PENDING_OPEN_POLL_BUDGET + 1;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+        let pending_polls = Arc::new(AtomicUsize::new(0));
+
+        reserve_conn(&pool);
+        let ready_client = synthetic_idle_client(&pool).await;
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(future::ready(Ok(ready_client))))
+            .is_ok());
+        for _ in 0..super::PENDING_OPEN_POLL_BUDGET {
+            reserve_conn(&pool);
+            assert!(pool
+                .inner
+                .new
+                .push(Box::pin(CountingPending {
+                    polls: pending_polls.clone(),
+                }))
+                .is_ok());
+        }
+
+        let (_, driver_waker) = count_waker();
+        let mut driver_cx = Context::from_waker(&driver_waker);
+        let mut driver_waiter = Box::pin(pool.get_handle());
+        let handle = match driver_waiter.as_mut().poll(&mut driver_cx) {
+            Poll::Ready(Ok(handle)) => handle,
+            _ => panic!("driver did not return ready pending-open connection"),
+        };
+        assert_eq!(
+            pending_polls.load(Ordering::SeqCst),
+            super::PENDING_OPEN_POLL_BUDGET - 1,
+            "first scan should leave one future from the cycle unscanned"
+        );
+
+        let (_, next_waker) = count_waker();
+        let mut next_cx = Context::from_waker(&next_waker);
+        let mut next_waiter = Box::pin(pool.get_handle());
+        assert!(matches!(
+            next_waiter.as_mut().poll(&mut next_cx),
+            Poll::Pending
+        ));
+        assert_eq!(
+            pending_polls.load(Ordering::SeqCst),
+            (super::PENDING_OPEN_POLL_BUDGET - 1) + super::PENDING_OPEN_POLL_BUDGET,
+            "a later waiter must be able to scan the unscanned pending-open futures"
+        );
+
+        drop(handle);
+        assert_eq!(pool.info().ongoing, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_releasing_driver_with_scan_needed_wakes_parked_waiter() -> Result<()> {
+        let pool_max = super::PENDING_OPEN_POLL_BUDGET + 1;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+
+        reserve_conn(&pool);
+        let first_ready_client = synthetic_idle_client(&pool).await;
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(future::ready(Ok(first_ready_client))))
+            .is_ok());
+        for _ in 0..super::PENDING_OPEN_POLL_BUDGET - 1 {
+            reserve_conn(&pool);
+            assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        }
+        reserve_conn(&pool);
+        let unscanned_ready_client = synthetic_idle_client(&pool).await;
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(future::ready(Ok(unscanned_ready_client))))
+            .is_ok());
+
+        let (_, driver_waker) = count_waker();
+        let mut driver_cx = Context::from_waker(&driver_waker);
+        let mut driver_pool = pool.clone();
+        let mut scan_remaining = 0usize;
+        assert!(pool.inner.try_acquire_pending_open_scan_driver());
+
+        driver_pool.handle_futures(&mut driver_cx, &mut scan_remaining)?;
+        assert_eq!(scan_remaining, 0);
+        assert!(pool.inner.pending_open_scan_needed.load(Ordering::Acquire));
+        let first_handle = driver_pool
+            .take_conn()
+            .expect("driver should consume the first ready connection");
+
+        let (parked_wakes, parked_waker) = count_waker();
+        let mut parked_cx = Context::from_waker(&parked_waker);
+        let mut parked_waiter = Box::pin(pool.get_handle());
+        assert!(matches!(
+            parked_waiter.as_mut().poll(&mut parked_cx),
+            Poll::Pending
+        ));
+        assert_eq!(parked_wakes.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.info().tasks_len, 1);
+
+        pool.inner.release_pending_open_scan_driver();
+        assert_eq!(
+            parked_wakes.load(Ordering::SeqCst),
+            1,
+            "releasing a driver while more scanning is needed must recruit parked waiters"
+        );
+
+        let second_handle = match parked_waiter.as_mut().poll(&mut parked_cx) {
+            Poll::Ready(Ok(handle)) => handle,
+            _ => panic!("parked waiter did not scan the unobserved ready pending-open future"),
+        };
+        assert_eq!(pool.info().ongoing, 2);
+
+        drop(second_handle);
+        drop(first_handle);
+        while pool.inner.new.pop().is_some() {
+            pool.inner.release_conn_slot();
+        }
+        assert_eq!(pool.info().ongoing, 0);
+        assert_eq!(pool.inner.conn_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_non_driver_park_rechecks_scan_needed_after_release() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
+        reserve_conn(&pool);
+        assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        pool.inner
+            .pending_open_scan_needed
+            .store(true, Ordering::Release);
+
+        let (wakes, waker) = count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut scan_driver = false;
+
+        pool.park_pending_open_waiter(&mut cx, &mut scan_driver);
+
+        assert!(
+            scan_driver,
+            "a waiter that parks after a missed release wake must recruit itself as scan driver"
+        );
+        assert!(pool.inner.pending_open_scan_driver.load(Ordering::Acquire));
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "recruited waiter must self-wake to drive the pending scan"
+        );
+        assert_eq!(pool.info().tasks_len, 1);
+
+        pool.inner.release_pending_open_scan_driver();
+        while pool.inner.new.pop().is_some() {
+            pool.inner.release_conn_slot();
+        }
+        assert_eq!(pool.inner.conn_count(), 0);
+        Ok(())
+    }
+
+    /// GRD-C001: when every pending-open future is still Pending after one
+    /// full scan cycle the self-wake must stop — no unbounded busy-loop.
+    /// Verifies that ceil(N/BUDGET) − 1 = 1 self-wake is produced and then
+    /// the chain terminates; the scan does not spin indefinitely.
+    #[tokio::test]
+    async fn test_all_pending_scan_cycle_stops_self_waking() -> Result<()> {
+        let pool_max = super::PENDING_OPEN_POLL_BUDGET + 1;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+
+        for _ in 0..pool_max {
+            reserve_conn(&pool);
+            assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        }
+
+        let (wakes, waker) = count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = Box::pin(pool.get_handle());
+
+        // Poll 1: scans BUDGET futures, exhausts budget with scan_remaining = 1,
+        // emits exactly one self-wake to continue the cycle.
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "expected exactly one self-wake after the first partial scan"
+        );
+        assert_eq!(
+            pool.info().tasks_len,
+            0,
+            "partial scan continuation should not also park the waiter"
+        );
+
+        // Poll 2 (driven by that self-wake): scans the remaining 1 future;
+        // scan_remaining reaches 0 — no further self-wake is emitted.
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "self-wake chain must stop once the full scan cycle is exhausted"
+        );
+        assert_eq!(
+            pool.info().tasks_len,
+            1,
+            "waiter should park after the scan cycle completes with all futures pending"
+        );
+        Ok(())
+    }
+
+    /// GRD-C001: stale scan counter — if the queue is drained by another
+    /// driver between the cycle snapshot and a continuation poll, the empty
+    /// pop must reset scan_remaining to 0 and must NOT emit a self-wake.
+    #[tokio::test]
+    async fn test_stale_scan_counter_does_not_busy_loop_on_empty_queue() -> Result<()> {
+        let pool_max = super::PENDING_OPEN_POLL_BUDGET + 1;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+
+        for _ in 0..pool_max {
+            reserve_conn(&pool);
+            assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        }
+
+        let (wakes, waker) = count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Simulate a mid-cycle state: scan_remaining = 1 (continuation wake
+        // was issued for 1 remaining future), but the queue has been drained
+        // by another driver in the meantime.
+        let mut scan_remaining: usize = 1;
+        while pool.inner.new.pop().is_some() {}
+        assert_eq!(pool.inner.new.len(), 0);
+
+        let mut driver = pool.clone();
+        driver.handle_futures(&mut cx, &mut scan_remaining)?;
+
+        assert_eq!(
+            scan_remaining, 0,
+            "scan_remaining must be reset when the queue is empty"
+        );
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            0,
+            "no self-wake must be emitted when the queue is empty"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_external_wake_during_scan_cycle_revisits_scanned_futures() -> Result<()> {
+        let pool_max = super::PENDING_OPEN_POLL_BUDGET + 1;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+        let stored_waker = Arc::new(Mutex::new(None));
+
+        reserve_conn(&pool);
+        let ready_client = synthetic_idle_client(&pool).await;
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(ReadyAfterStoredWake {
+                client: Some(ready_client),
+                polls: 0,
+                waker: stored_waker.clone(),
+            }))
+            .is_ok());
+        for _ in 0..super::PENDING_OPEN_POLL_BUDGET - 1 {
+            reserve_conn(&pool);
+            assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        }
+        reserve_conn(&pool);
+        assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+
+        let (wakes, waker) = count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = Box::pin(pool.get_handle());
+
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.info().tasks_len, 0);
+
+        let pending_open_waker = stored_waker.lock().unwrap().take().unwrap();
+        pending_open_waker.wake();
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            2,
+            "external wake should wake the active scan driver even without parked waiters"
+        );
+
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            pool.info().tasks_len,
+            0,
+            "externally woken first-slice future should schedule a bounded rescan instead of parking"
+        );
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            3,
+            "rescan should be explicitly scheduled after the coalesced external wake is observed"
+        );
+
+        let handle = match waiter.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(handle)) => handle,
+            _ => panic!("rescan did not observe the externally woken pending-open future"),
+        };
+        assert_eq!(pool.info().ongoing, 1);
+        drop(handle);
+        assert_eq!(pool.info().ongoing, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_open_wake_after_driver_drop_recruits_parked_waiter() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
+        let stored_waker = Arc::new(Mutex::new(None));
+
+        reserve_conn(&pool);
+        let ready_client = synthetic_idle_client(&pool).await;
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(ReadyAfterStoredWake {
+                client: Some(ready_client),
+                polls: 0,
+                waker: stored_waker.clone(),
+            }))
+            .is_ok());
+
+        let (driver_wakes, driver_waker) = count_waker();
+        let mut driver_cx = Context::from_waker(&driver_waker);
+        let mut driver_waiter = Box::pin(pool.get_handle());
+        assert!(matches!(
+            driver_waiter.as_mut().poll(&mut driver_cx),
+            Poll::Pending
+        ));
+        assert_eq!(driver_wakes.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.info().tasks_len, 1);
+        drop(driver_waiter);
+
+        let (parked_wakes, parked_waker) = count_waker();
+        let mut parked_cx = Context::from_waker(&parked_waker);
+        let mut parked_waiter = Box::pin(pool.get_handle());
+        assert!(matches!(
+            parked_waiter.as_mut().poll(&mut parked_cx),
+            Poll::Pending
+        ));
+        assert_eq!(pool.info().tasks_len, 2);
+
+        let pending_open_waker = stored_waker.lock().unwrap().take().unwrap();
+        pending_open_waker.wake();
+        assert_eq!(
+            parked_wakes.load(Ordering::SeqCst),
+            1,
+            "pending-open wake after the original driver is gone must recruit parked waiters"
+        );
+        assert_eq!(pool.info().tasks_len, 0);
+
+        let handle = match parked_waiter.as_mut().poll(&mut parked_cx) {
+            Poll::Ready(Ok(handle)) => handle,
+            _ => panic!("parked waiter did not observe ready pending-open future"),
+        };
+        assert_eq!(pool.info().ongoing, 1);
+        drop(handle);
+        assert_eq!(pool.info().ongoing, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_idle_return_mid_scan_hands_off_driver() -> Result<()> {
+        let pending_open_count = super::PENDING_OPEN_POLL_BUDGET + 1;
+        let pool_max = pending_open_count + 1;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+        let stored_waker = Arc::new(Mutex::new(None));
+
+        reserve_conn(&pool);
+        assert!(pool
+            .inner
+            .idle
+            .push(synthetic_idle_client(&pool).await)
+            .is_ok());
+
+        reserve_conn(&pool);
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(ReadyAfterStoredWake {
+                client: Some(synthetic_idle_client(&pool).await),
+                polls: 0,
+                waker: stored_waker.clone(),
+            }))
+            .is_ok());
+        for _ in 0..super::PENDING_OPEN_POLL_BUDGET - 1 {
+            reserve_conn(&pool);
+            assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        }
+        reserve_conn(&pool);
+        assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+
+        let (driver_wakes, driver_waker) = count_waker();
+        let mut driver_cx = Context::from_waker(&driver_waker);
+        let mut driver_waiter = Box::pin(pool.get_handle());
+        let idle_handle = match driver_waiter.as_mut().poll(&mut driver_cx) {
+            Poll::Ready(Ok(handle)) => handle,
+            _ => panic!("driver did not return available idle connection"),
+        };
+        assert_eq!(driver_wakes.load(Ordering::SeqCst), 1);
+        assert!(!pool.inner.pending_open_scan_driver.load(Ordering::Acquire));
+        assert!(pool
+            .inner
+            .pending_open_scan_driver_waker
+            .lock()
+            .unwrap()
+            .is_none());
+
+        let pending_open_waker = stored_waker.lock().unwrap().take().unwrap();
+        pending_open_waker.wake();
+        assert_eq!(
+            driver_wakes.load(Ordering::SeqCst),
+            1,
+            "completed driver futures retained by callers must not keep future pending-open wakes on a stale driver"
+        );
+
+        let (_, next_waker) = count_waker();
+        let mut next_cx = Context::from_waker(&next_waker);
+        let mut next_waiter = Box::pin(pool.get_handle());
+        let handle = match next_waiter.as_mut().poll(&mut next_cx) {
+            Poll::Ready(Ok(handle)) => handle,
+            _ => panic!("next waiter did not observe ready pending-open future"),
+        };
+        assert_eq!(pool.info().ongoing, 2);
+        drop(handle);
+        drop(idle_handle);
+        assert_eq!(pool.info().ongoing, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_only_one_waiter_drives_pending_open_scan_cycle() -> Result<()> {
+        let pool_max = super::PENDING_OPEN_POLL_BUDGET + 1;
+        let waiter_count = pool_max * 2;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+        let polls = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..pool_max {
+            reserve_conn(&pool);
+            assert!(pool
+                .inner
+                .new
+                .push(Box::pin(CountingPending {
+                    polls: polls.clone(),
+                }))
+                .is_ok());
+        }
+
+        let (wakes, waker) = count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut waiters: Vec<_> = (0..waiter_count)
+            .map(|_| Box::pin(pool.get_handle()))
+            .collect();
+
+        assert!(matches!(waiters[0].as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            super::PENDING_OPEN_POLL_BUDGET
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.info().tasks_len, 0);
+
+        for waiter in waiters.iter_mut().skip(1) {
+            assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+        }
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            super::PENDING_OPEN_POLL_BUDGET,
+            "non-driver waiters should park instead of scanning the same pending opens"
+        );
+        assert_eq!(pool.info().tasks_len, waiter_count - 1);
+
+        assert!(matches!(waiters[0].as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            pool_max,
+            "the single scan driver should finish the bounded cycle once"
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.info().tasks_len, waiter_count);
+
+        let mut late_waiter = Box::pin(pool.get_handle());
+        assert!(matches!(late_waiter.as_mut().poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            pool_max,
+            "late waiters should not start redundant scans after an all-pending cycle"
+        );
+        assert_eq!(pool.info().tasks_len, waiter_count + 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_scan_continuation_wakes_parked_waiter() -> Result<()> {
+        let pool_max = super::PENDING_OPEN_POLL_BUDGET + 1;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+
+        for _ in 0..pool_max {
+            reserve_conn(&pool);
+            assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        }
+
+        let (parked_wakes, parked_waker) = count_waker();
+        let mut parked_cx = Context::from_waker(&parked_waker);
+        let mut parked_waiter = Box::pin(pool.get_handle());
+
+        assert!(matches!(
+            parked_waiter.as_mut().poll(&mut parked_cx),
+            Poll::Pending
+        ));
+        assert_eq!(pool.info().tasks_len, 0);
+        assert!(matches!(
+            parked_waiter.as_mut().poll(&mut parked_cx),
+            Poll::Pending
+        ));
+        assert_eq!(pool.info().tasks_len, 1);
+        let parked_wakes_before_continuation = parked_wakes.load(Ordering::SeqCst);
+
+        while pool.inner.new.pop().is_some() {}
+        for _ in 0..pool_max - 1 {
+            assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        }
+        let ready_client = synthetic_idle_client(&pool).await;
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(future::ready(Ok(ready_client))))
+            .is_ok());
+        pool.inner
+            .pending_open_scan_needed
+            .store(true, Ordering::Release);
+
+        let (driver_wakes, driver_waker) = count_waker();
+        let mut driver_cx = Context::from_waker(&driver_waker);
+        let mut driver_waiter = Box::pin(pool.get_handle());
+
+        assert!(matches!(
+            driver_waiter.as_mut().poll(&mut driver_cx),
+            Poll::Pending
+        ));
+        assert_eq!(driver_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            parked_wakes.load(Ordering::SeqCst),
+            parked_wakes_before_continuation,
+            "normal scan continuation should only self-wake the driving waiter"
+        );
+        assert_eq!(pool.info().tasks_len, 1);
+        drop(driver_waiter);
+        assert_eq!(
+            parked_wakes.load(Ordering::SeqCst),
+            parked_wakes_before_continuation + 1,
+            "dropping the mid-cycle waiter must hand continuation to a parked waiter"
+        );
+        assert_eq!(pool.info().tasks_len, 0);
+
+        let handle = match parked_waiter.as_mut().poll(&mut parked_cx) {
+            Poll::Ready(Ok(handle)) => handle,
+            _ => panic!("parked waiter did not acquire the ready pending-open connection"),
+        };
+        assert_eq!(pool.info().ongoing, 1);
+        drop(handle);
+        assert_eq!(pool.info().ongoing, 0);
         Ok(())
     }
 }
