@@ -1,7 +1,9 @@
-version: '3'
 services:
   clickhouse:
-    image: yandex/clickhouse-server
+    image: clickhouse/clickhouse-server
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     ports:
       - 8123:8123
       - 9000:9000

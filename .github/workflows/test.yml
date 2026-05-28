@@ -18,6 +18,9 @@ jobs:
     services:
       clickhouse:
         image: clickhouse/clickhouse-server
+        env:
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
         ports:
           - 9000:9000
     steps:
@@ -45,6 +48,8 @@ jobs:
           -v ./extras/ci/overrides.xml:/etc/clickhouse-server/config.d/overrides.xml
           -e CH_SSL_CERTIFICATE=/etc/clickhouse-server/config.d/server.crt
           -e CH_SSL_PRIVATE_KEY=/etc/clickhouse-server/config.d/server.key
+          -e CLICKHOUSE_USER=default
+          -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
           --network host
           --rm
           --detach
@@ -72,6 +77,8 @@ jobs:
           -v ./extras/ci/overrides.xml:/etc/clickhouse-server/config.d/overrides.xml
           -e CH_SSL_CERTIFICATE=/etc/clickhouse-server/config.d/server.crt
           -e CH_SSL_PRIVATE_KEY=/etc/clickhouse-server/config.d/server.key
+          -e CLICKHOUSE_USER=default
+          -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
           --network host
           --rm
           --detach
