@@ -22,6 +22,10 @@ pub struct GetHandle {
     /// so that `recruit_one_scan_driver` skips this entry if it is still in the
     /// queue when this future is cancelled.
     park_slot: Option<Arc<TaskSlot>>,
+    /// Whether this future has registered an unmet-demand waiter with the pool
+    /// that has not yet been released.  Ensures the pool's `waiters` counter is
+    /// balanced exactly once on completion or cancellation.
+    demand_registered: bool,
 }
 
 impl GetHandle {
@@ -31,6 +35,7 @@ impl GetHandle {
             pending_open_scan_remaining: 0,
             pending_open_scan_driver: false,
             park_slot: None,
+            demand_registered: false,
         }
     }
 }
@@ -45,12 +50,19 @@ impl Future for GetHandle {
             &mut this.pending_open_scan_remaining,
             &mut this.pending_open_scan_driver,
             &mut this.park_slot,
+            &mut this.demand_registered,
         )
     }
 }
 
 impl Drop for GetHandle {
     fn drop(&mut self) {
+        // Release this future's unmet-demand registration so the pool does not
+        // keep opening connections for a waiter that has gone away.
+        if self.demand_registered {
+            self.pool.inner.release_waiter();
+            self.demand_registered = false;
+        }
         // Mark any current tasks-queue entry stale so recruit_one_scan_driver
         // skips it.  Do this before handing off the scan driver so that the
         // recruited waiter does not accidentally pop our own (now-stale) entry.

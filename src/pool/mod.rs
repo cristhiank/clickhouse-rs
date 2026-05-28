@@ -107,6 +107,12 @@ pub(crate) struct Inner {
     idle: crossbeam::queue::ArrayQueue<ClientHandle>,
     tasks: crossbeam::queue::SegQueue<TaskEntry>,
     ongoing: atomic::AtomicUsize,
+    /// Number of waiters with currently-unmet demand (have polled `Pending`
+    /// without obtaining a connection and have not yet completed or been
+    /// cancelled).  Speculative connection opening is bounded by this so a
+    /// single `get_handle()` opens ~one connection instead of ramping to
+    /// `pool_max`.
+    waiters: atomic::AtomicUsize,
     conn_slots: atomic::AtomicUsize,
     pending_open_scan_driver: atomic::AtomicBool,
     pending_open_scan_driver_waker: Mutex<Option<Waker>>,
@@ -160,6 +166,38 @@ impl Inner {
         {
             warn!("release_conn_slot called when no connections are reserved");
         }
+    }
+
+    /// Records a waiter with currently-unmet demand.  Must be balanced by
+    /// exactly one `release_waiter` (on completion or cancellation).
+    fn register_waiter(&self) {
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Clears a previously-registered unmet-demand waiter.
+    fn release_waiter(&self) {
+        if self
+            .waiters
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_err()
+        {
+            warn!("release_waiter called when no waiters are registered");
+        }
+    }
+
+    /// Upper bound on how many connections may exist (idle + in-flight +
+    /// checked-out) given current demand: one per checked-out connection plus
+    /// one per waiter, capped by `pool_max`.  Opening is gated by this so a
+    /// lone `get_handle()` opens a single connection while concurrent waiters
+    /// still ramp up to `pool_max`.
+    fn demand_limit(&self, max: usize) -> usize {
+        let demand = self
+            .ongoing
+            .load(Ordering::Acquire)
+            .saturating_add(self.waiters.load(Ordering::Acquire));
+        max.min(demand)
     }
 
     pub(crate) fn release_pending_open_scan_driver(&self) {
@@ -333,6 +371,7 @@ impl Pool {
             idle: crossbeam::queue::ArrayQueue::new(max),
             tasks: crossbeam::queue::SegQueue::new(),
             ongoing: atomic::AtomicUsize::new(0),
+            waiters: atomic::AtomicUsize::new(0),
             conn_slots: atomic::AtomicUsize::new(0),
             pending_open_scan_driver: atomic::AtomicBool::new(false),
             pending_open_scan_driver_waker: Mutex::new(None),
@@ -369,6 +408,7 @@ impl Pool {
         scan_remaining: &mut usize,
         scan_driver: &mut bool,
         park_slot: &mut Option<Arc<TaskSlot>>,
+        demand_registered: &mut bool,
     ) -> Poll<Result<ClientHandle>> {
         if !*scan_driver
             && self.inner.pending_open_scan_needed.load(Ordering::Acquire)
@@ -405,6 +445,10 @@ impl Pool {
                 }
                 *scan_driver = false;
             }
+            if *demand_registered {
+                self.inner.release_waiter();
+                *demand_registered = false;
+            }
             if let Err(err) = handle_futures_result {
                 warn!(
                     "Pending ClickHouse connection failed while idle connections were available; using idle connection instead. error={}; pool_info={:?}",
@@ -420,10 +464,25 @@ impl Pool {
                 self.inner.release_pending_open_scan_driver();
                 *scan_driver = false;
             }
+            // When `!scan_complete` the scan-driver role is intentionally NOT
+            // released here; `GetHandle::drop` hands it off so an in-progress
+            // scan cycle is not abandoned.
+            if *demand_registered {
+                self.inner.release_waiter();
+                *demand_registered = false;
+            }
             return Poll::Ready(Err(err));
         }
 
-        if self.inner.try_reserve_conn(self.max) {
+        // Register this waiter's unmet demand exactly once so that speculative
+        // connection opening below is bounded by actual demand rather than
+        // ramping to `pool_max` on a single `get_handle()`.
+        if !*demand_registered {
+            self.inner.register_waiter();
+            *demand_registered = true;
+        }
+
+        if self.inner.try_reserve_conn(self.inner.demand_limit(self.max)) {
             match self.inner.new.push(self.new_connection()) {
                 Ok(()) => {
                     self.inner
@@ -873,11 +932,7 @@ mod test {
 
     #[tokio::test]
     async fn test_connect() -> Result<()> {
-        // pool_max(1) is required: get_handle() eagerly opens pending connections
-        // up to pool_max, so the default pool would leave more than one idle handle.
-        let options = Options::from_str(DATABASE_URL.as_str())
-            .unwrap()
-            .pool_max(1);
+        let options = Options::from_str(DATABASE_URL.as_str()).unwrap();
         let pool = Pool::new(options);
         {
             let mut c = pool.get_handle().await?;
@@ -900,9 +955,7 @@ mod test {
             Ok(())
         }
 
-        let options = Options::from_str(DATABASE_URL.as_str())
-            .unwrap()
-            .pool_max(1);
+        let options = Options::from_str(DATABASE_URL.as_str()).unwrap();
         let pool = Pool::new(options);
         done(pool.clone()).await?;
         assert_eq!(pool.info().idle_len, 0);
@@ -957,9 +1010,7 @@ mod test {
 
     #[tokio::test]
     async fn test_wrong_insert() -> Result<()> {
-        let options = Options::from_str(DATABASE_URL.as_str())
-            .unwrap()
-            .pool_max(1);
+        let options = Options::from_str(DATABASE_URL.as_str()).unwrap();
         let pool = Pool::new(options);
         {
             let block = Block::new();
@@ -975,9 +1026,7 @@ mod test {
 
     #[tokio::test]
     async fn test_wrong_execute() -> Result<()> {
-        let options = Options::from_str(DATABASE_URL.as_str())
-            .unwrap()
-            .pool_max(1);
+        let options = Options::from_str(DATABASE_URL.as_str()).unwrap();
         let pool = Pool::new(options);
         {
             let mut c = pool.get_handle().await?;
@@ -1041,6 +1090,103 @@ mod test {
         .unwrap();
 
         assert_eq!(pool.info().new_len, pool_max);
+        accept.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_handle_opens_only_for_demand_below_pool_max() -> Result<()> {
+        // A pool_max well above the number of waiters: demand-based opening must
+        // open exactly one pending connection per waiter, NOT ramp to pool_max.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+
+        let pool_max = 8;
+        let waiter_count = 2;
+        let options = Options::from_str(&format!("tcp://{}", addr))
+            .unwrap()
+            .pool_min(0)
+            .pool_max(pool_max)
+            .connection_timeout(Duration::from_secs(30));
+        let pool = Pool::new(options);
+        let mut handles: Vec<_> = (0..waiter_count)
+            .map(|_| Box::pin(pool.get_handle()))
+            .collect();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            future::poll_fn(|cx| {
+                for handle in &mut handles {
+                    let _ = handle.as_mut().poll(cx);
+                }
+
+                // Opening is gated by demand, so new_len must never exceed the
+                // waiter count even though pool_max is much larger.
+                assert!(pool.info().new_len <= waiter_count);
+                if pool.info().new_len == waiter_count {
+                    Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(pool.info().new_len, waiter_count);
+        accept.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_waiter_releases_demand() -> Result<()> {
+        // A waiter dropped before completing must release its demand so the pool
+        // does not keep opening connections for a waiter that has gone away.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+
+        let pool_max = 8;
+        let options = Options::from_str(&format!("tcp://{}", addr))
+            .unwrap()
+            .pool_min(0)
+            .pool_max(pool_max)
+            .connection_timeout(Duration::from_secs(30));
+        let pool = Pool::new(options);
+
+        let (_, waker) = count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First waiter registers demand and opens exactly one pending connection,
+        // then is cancelled (dropped) while still waiting.
+        {
+            let mut first = Box::pin(pool.get_handle());
+            let _ = first.as_mut().poll(&mut cx);
+            assert_eq!(pool.info().new_len, 1);
+        }
+
+        // The orphaned pending connection (new_len == 1) already satisfies the
+        // fresh waiter's demand of one, so it must NOT open a second connection.
+        // If the cancelled waiter had leaked its registration, demand would be 2
+        // and this waiter would open a redundant connection (new_len == 2).
+        let mut second = Box::pin(pool.get_handle());
+        for _ in 0..4 {
+            let _ = second.as_mut().poll(&mut cx);
+            assert_eq!(pool.info().new_len, 1);
+        }
+
         accept.abort();
         Ok(())
     }
