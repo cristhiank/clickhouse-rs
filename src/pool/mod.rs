@@ -46,21 +46,73 @@ impl Wake for PendingOpenWake {
             if let Some(waker) = driver_waker {
                 waker.wake();
             } else {
-                inner.wake_tasks();
+                // No active driver: recruit exactly one parked waiter instead of
+                // waking all of them.  Only one waiter can acquire the scan-driver
+                // role, so waking everyone is needless amplification.
+                inner.recruit_one_scan_driver();
             }
         }
     }
 }
 
+const TASK_SLOT_LIVE: u8 = 0;
+pub(crate) const TASK_SLOT_RECRUITED: u8 = 1;
+const TASK_SLOT_STALE: u8 = 2;
+
+/// A parked waiter's slot in `Inner.tasks`.  The state tracks whether the
+/// owning `GetHandle` is still live, has been recruited to drive a pending-open
+/// scan, or has gone stale because the future was dropped or resumed.
+pub(crate) struct TaskSlot {
+    state: atomic::AtomicU8,
+}
+
+impl TaskSlot {
+    fn live() -> Arc<Self> {
+        Arc::new(Self {
+            state: atomic::AtomicU8::new(TASK_SLOT_LIVE),
+        })
+    }
+
+    #[cfg(test)]
+    fn stale() -> Arc<Self> {
+        Arc::new(Self {
+            state: atomic::AtomicU8::new(TASK_SLOT_STALE),
+        })
+    }
+
+    fn is_active(&self) -> bool {
+        self.state.load(Ordering::Acquire) != TASK_SLOT_STALE
+    }
+
+    fn try_recruit(&self) -> bool {
+        self.state
+            .compare_exchange(
+                TASK_SLOT_LIVE,
+                TASK_SLOT_RECRUITED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn mark_stale(&self) -> u8 {
+        self.state.swap(TASK_SLOT_STALE, Ordering::AcqRel)
+    }
+}
+
+type TaskEntry = (Arc<TaskSlot>, Waker);
+
 pub(crate) struct Inner {
     new: crossbeam::queue::ArrayQueue<BoxFuture<'static, Result<ClientHandle>>>,
     idle: crossbeam::queue::ArrayQueue<ClientHandle>,
-    tasks: crossbeam::queue::SegQueue<Waker>,
+    tasks: crossbeam::queue::SegQueue<TaskEntry>,
     ongoing: atomic::AtomicUsize,
     conn_slots: atomic::AtomicUsize,
     pending_open_scan_driver: atomic::AtomicBool,
     pending_open_scan_driver_waker: Mutex<Option<Waker>>,
-    pending_open_scan_needed: Arc<atomic::AtomicBool>,
+    /// No longer wrapped in `Arc`: `Inner` itself is already behind `Arc<Inner>`,
+    /// so the outer `Arc` was redundant.
+    pending_open_scan_needed: atomic::AtomicBool,
     hosts: Vec<Url>,
     connections_num: atomic::AtomicUsize,
 }
@@ -119,7 +171,10 @@ impl Inner {
         }
 
         if self.pending_open_scan_needed.load(Ordering::Acquire) {
-            self.wake_tasks();
+            // Recruit exactly one parked waiter to take over the scan-driver
+            // role.  wake_tasks (wake-all) is intentionally NOT used here: we
+            // only need a single new driver, not every parked waiter.
+            self.recruit_one_scan_driver();
         }
     }
 
@@ -139,8 +194,24 @@ impl Inner {
     }
 
     fn wake_tasks(&self) {
-        while let Some(task) = self.tasks.pop() {
-            task.wake()
+        while let Some((slot, waker)) = self.tasks.pop() {
+            if slot.is_active() {
+                waker.wake();
+            }
+            // Stale entries are silently drained.
+        }
+    }
+
+    /// Wake exactly one live parked waiter and discard all stale entries
+    /// encountered before it.  Used to recruit a new pending-open scan driver
+    /// without amplifying wakes to every parked waiter.
+    pub(crate) fn recruit_one_scan_driver(&self) {
+        while let Some((slot, waker)) = self.tasks.pop() {
+            if slot.try_recruit() {
+                waker.wake();
+                return;
+            }
+            // Stale entry — drain it and keep searching.
         }
     }
 }
@@ -265,7 +336,7 @@ impl Pool {
             conn_slots: atomic::AtomicUsize::new(0),
             pending_open_scan_driver: atomic::AtomicBool::new(false),
             pending_open_scan_driver_waker: Mutex::new(None),
-            pending_open_scan_needed: Arc::new(atomic::AtomicBool::new(true)),
+            pending_open_scan_needed: atomic::AtomicBool::new(true),
             connections_num: atomic::AtomicUsize::new(0),
             hosts,
         });
@@ -297,12 +368,16 @@ impl Pool {
         cx: &mut Context<'_>,
         scan_remaining: &mut usize,
         scan_driver: &mut bool,
+        park_slot: &mut Option<Arc<TaskSlot>>,
     ) -> Poll<Result<ClientHandle>> {
         if !*scan_driver
             && self.inner.pending_open_scan_needed.load(Ordering::Acquire)
             && self.inner.try_acquire_pending_open_scan_driver()
         {
             *scan_driver = true;
+            if let Some(slot) = park_slot.take() {
+                slot.mark_stale();
+            }
         }
         if *scan_driver {
             self.inner.set_pending_open_scan_driver_waker(cx.waker());
@@ -367,25 +442,48 @@ impl Pool {
                 return Poll::Pending;
             }
 
-            self.inner.tasks.push(cx.waker().clone());
+            // Park with a live slot so that recruit_one_scan_driver can find
+            // us when the next pending-open wake arrives.
+            let slot = TaskSlot::live();
+            // Invalidate any previous slot before registering a new one.
+            if let Some(old) = park_slot.take() {
+                old.mark_stale();
+            }
+            self.inner.tasks.push((slot.clone(), cx.waker().clone()));
+            *park_slot = Some(slot);
             self.inner.release_pending_open_scan_driver();
             *scan_driver = false;
             return Poll::Pending;
         }
 
         if *scan_remaining == 0 {
-            self.park_pending_open_waiter(cx, scan_driver);
+            self.park_pending_open_waiter(cx, scan_driver, park_slot);
         }
         Poll::Pending
     }
 
-    fn park_pending_open_waiter(&self, cx: &mut Context<'_>, scan_driver: &mut bool) {
-        self.inner.tasks.push(cx.waker().clone());
+    fn park_pending_open_waiter(
+        &self,
+        cx: &mut Context<'_>,
+        scan_driver: &mut bool,
+        park_slot: &mut Option<Arc<TaskSlot>>,
+    ) {
+        // Invalidate any previous slot to avoid stale-but-alive entries in the
+        // queue that could misdirect a future recruit_one_scan_driver call.
+        if let Some(old) = park_slot.take() {
+            old.mark_stale();
+        }
+        let slot = TaskSlot::live();
+        self.inner.tasks.push((slot.clone(), cx.waker().clone()));
+        *park_slot = Some(slot);
 
         if !*scan_driver
             && self.inner.pending_open_scan_needed.load(Ordering::Acquire)
             && self.inner.try_acquire_pending_open_scan_driver()
         {
+            if let Some(slot) = park_slot.take() {
+                slot.mark_stale();
+            }
             *scan_driver = true;
             self.inner.set_pending_open_scan_driver_waker(cx.waker());
             cx.waker().wake_by_ref();
@@ -693,7 +791,7 @@ mod test {
         Block, ClientHandle, Options,
     };
 
-    use super::{Pool, PoolBinding};
+    use super::{Pool, PoolBinding, TaskSlot};
     use url::Url;
 
     struct CountWake {
@@ -1044,7 +1142,7 @@ mod test {
         let mut scan = 0usize;
         assert!(driver.handle_futures(&mut live_cx, &mut scan).is_err());
 
-        assert_eq!(stale_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(stale_wakes.load(Ordering::SeqCst), 0);
         assert_eq!(live_wakes.load(Ordering::SeqCst), 1);
         assert_eq!(pool.info().tasks_len, 0);
         assert_eq!(pool.inner.conn_count(), 0);
@@ -1172,7 +1270,8 @@ mod test {
             .is_ok());
 
         let (wakes, waker) = count_waker();
-        pool.inner.tasks.push(waker.clone());
+        let slot = TaskSlot::live();
+        pool.inner.tasks.push((slot, waker.clone()));
         let mut cx = Context::from_waker(&waker);
         let mut driver = pool.clone();
 
@@ -1378,7 +1477,8 @@ mod test {
         let mut cx = Context::from_waker(&waker);
         let mut scan_driver = false;
 
-        pool.park_pending_open_waiter(&mut cx, &mut scan_driver);
+        let mut park_slot = None;
+        pool.park_pending_open_waiter(&mut cx, &mut scan_driver, &mut park_slot);
 
         assert!(
             scan_driver,
@@ -1805,6 +1905,300 @@ mod test {
         assert_eq!(pool.info().ongoing, 1);
         drop(handle);
         assert_eq!(pool.info().ongoing, 0);
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for recruit-one semantics and live-aware task entries
+    // -------------------------------------------------------------------------
+
+    /// When a pending-open future wakes (PendingOpenWake) and there is no
+    /// active scan-driver waker, exactly ONE parked live waiter must be
+    /// recruited — not all of them.
+    #[tokio::test]
+    async fn test_pending_open_wake_recruits_exactly_one_live_waiter() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
+        let stored_waker = Arc::new(Mutex::new(None));
+
+        // The ReadyAfterStoredWake future stores the PendingOpenWake waker on
+        // its first poll so that we can fire it later from test code.
+        reserve_conn(&pool);
+        let ready_client = synthetic_idle_client(&pool).await;
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(ReadyAfterStoredWake {
+                client: Some(ready_client),
+                polls: 0,
+                waker: stored_waker.clone(),
+            }))
+            .is_ok());
+
+        // Poll a temporary driver to capture the PendingOpenWake waker.
+        let (_, tmp_waker) = count_waker();
+        let mut tmp_cx = Context::from_waker(&tmp_waker);
+        let mut tmp_waiter = Box::pin(pool.get_handle());
+        assert!(matches!(
+            tmp_waiter.as_mut().poll(&mut tmp_cx),
+            Poll::Pending
+        ));
+        // Drop the driver: marks its tasks-entry stale and releases the driver
+        // role via handoff.  The queue was empty at that point so nothing is
+        // recruited by the handoff.
+        drop(tmp_waiter);
+
+        // Capture the PendingOpenWake waker stored by ReadyAfterStoredWake.
+        let pending_open_waker = stored_waker
+            .lock()
+            .unwrap()
+            .take()
+            .expect("ReadyAfterStoredWake must store a waker on first poll");
+
+        // Manually push three fresh live entries so we have multiple candidates.
+        let (wakes_x, waker_x) = count_waker();
+        let (wakes_y, waker_y) = count_waker();
+        let (wakes_z, waker_z) = count_waker();
+        pool.inner.tasks.push((TaskSlot::live(), waker_x));
+        pool.inner.tasks.push((TaskSlot::live(), waker_y));
+        pool.inner.tasks.push((TaskSlot::live(), waker_z));
+
+        assert!(
+            !pool.inner.pending_open_scan_driver.load(Ordering::Acquire),
+            "no active scan driver before firing"
+        );
+
+        // Fire the PendingOpenWake: no driver waker → must call recruit_one.
+        pending_open_waker.wake();
+
+        let total = wakes_x.load(Ordering::SeqCst)
+            + wakes_y.load(Ordering::SeqCst)
+            + wakes_z.load(Ordering::SeqCst);
+        assert_eq!(
+            total, 1,
+            "recruit-one: exactly one live waiter must be woken, got {}",
+            total
+        );
+        assert_eq!(
+            pool.info().tasks_len,
+            2,
+            "the two un-recruited entries must remain in tasks"
+        );
+
+        while pool.inner.new.pop().is_some() {
+            pool.inner.release_conn_slot();
+        }
+        Ok(())
+    }
+
+    /// If a recruit-one wake targets a parked waiter that is cancelled before
+    /// its next poll, that recruited responsibility must hand off to another
+    /// live parked waiter.
+    #[tokio::test]
+    async fn test_cancelled_recruited_waiter_hands_off_to_next_waiter() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
+        let stored_waker = Arc::new(Mutex::new(None));
+
+        reserve_conn(&pool);
+        let ready_client = synthetic_idle_client(&pool).await;
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(ReadyAfterStoredWake {
+                client: Some(ready_client),
+                polls: 0,
+                waker: stored_waker.clone(),
+            }))
+            .is_ok());
+
+        let (wakes_a, waker_a) = count_waker();
+        let (wakes_b, waker_b) = count_waker();
+        let mut cx_a = Context::from_waker(&waker_a);
+        let mut cx_b = Context::from_waker(&waker_b);
+        let mut waiter_a = Box::pin(pool.get_handle());
+        let mut waiter_b = Box::pin(pool.get_handle());
+
+        assert!(matches!(waiter_a.as_mut().poll(&mut cx_a), Poll::Pending));
+        assert!(matches!(waiter_b.as_mut().poll(&mut cx_b), Poll::Pending));
+        assert_eq!(pool.info().tasks_len, 2);
+
+        let pending_open_waker = stored_waker
+            .lock()
+            .unwrap()
+            .take()
+            .expect("ReadyAfterStoredWake must store a waker on first poll");
+
+        pending_open_waker.wake();
+        assert_eq!(
+            wakes_a.load(Ordering::SeqCst),
+            1,
+            "first parked waiter should be the recruited waiter"
+        );
+        assert_eq!(
+            wakes_b.load(Ordering::SeqCst),
+            0,
+            "second parked waiter should not be woken by the initial recruit"
+        );
+
+        drop(waiter_a);
+        assert_eq!(
+            wakes_b.load(Ordering::SeqCst),
+            1,
+            "dropping the recruited waiter must recruit the next live waiter"
+        );
+
+        let handle = match waiter_b.as_mut().poll(&mut cx_b) {
+            Poll::Ready(Ok(handle)) => handle,
+            _ => panic!("handoff waiter did not drive the pending-open scan"),
+        };
+        assert_eq!(pool.info().ongoing, 1);
+        drop(handle);
+        assert_eq!(pool.info().ongoing, 0);
+        Ok(())
+    }
+
+    /// Stale entries that precede a live entry must be skipped/drained, and
+    /// the live waiter must be successfully recruited.
+    #[tokio::test]
+    async fn test_recruit_one_skips_stale_entries_before_live_waiter() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
+
+        // Push two stale entries (alive=false) followed by one live entry
+        // directly into tasks so that the test is independent of the
+        // GetHandle polling path.
+        let (stale_wakes_1, stale_waker_1) = count_waker();
+        let (stale_wakes_2, stale_waker_2) = count_waker();
+        let (live_wakes, live_waker) = count_waker();
+
+        pool.inner.tasks.push((TaskSlot::stale(), stale_waker_1));
+        pool.inner.tasks.push((TaskSlot::stale(), stale_waker_2));
+        pool.inner.tasks.push((TaskSlot::live(), live_waker));
+
+        assert_eq!(pool.info().tasks_len, 3);
+
+        // Trigger recruit_one_scan_driver via release_pending_open_scan_driver.
+        pool.inner
+            .pending_open_scan_needed
+            .store(true, Ordering::Release);
+        assert!(pool.inner.try_acquire_pending_open_scan_driver());
+        pool.inner.release_pending_open_scan_driver();
+
+        assert_eq!(
+            stale_wakes_1.load(Ordering::SeqCst),
+            0,
+            "stale entry 1 must not be woken"
+        );
+        assert_eq!(
+            stale_wakes_2.load(Ordering::SeqCst),
+            0,
+            "stale entry 2 must not be woken"
+        );
+        assert_eq!(
+            live_wakes.load(Ordering::SeqCst),
+            1,
+            "live waiter must be recruited"
+        );
+        assert_eq!(
+            pool.info().tasks_len,
+            0,
+            "all entries (stale and recruited) must be drained from the queue"
+        );
+        Ok(())
+    }
+
+    /// Repeated pending-open wakes must each recruit at most one waiter
+    /// (O(wakes) total, not O(waiters × wakes)).
+    #[tokio::test]
+    async fn test_repeated_pending_open_wakes_are_o_wakes_not_o_waiters_times_wakes() -> Result<()>
+    {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(5));
+
+        // Push 5 live entries into tasks.
+        let wakes_counters: Vec<Arc<AtomicUsize>> =
+            (0..5).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        for i in 0..5 {
+            pool.inner.tasks.push((
+                TaskSlot::live(),
+                Waker::from(Arc::new(CountWake {
+                    wakes: wakes_counters[i].clone(),
+                })),
+            ));
+        }
+
+        // Fire the recruit-one path 3 times by acquiring/releasing the scan
+        // driver with pending_open_scan_needed=true.  Each release calls
+        // recruit_one_scan_driver(), which must wake exactly one waiter.
+        for _ in 0..3 {
+            pool.inner
+                .pending_open_scan_needed
+                .store(true, Ordering::Release);
+            assert!(pool.inner.try_acquire_pending_open_scan_driver());
+            pool.inner.release_pending_open_scan_driver();
+        }
+
+        let total: usize = wakes_counters
+            .iter()
+            .map(|w| w.load(Ordering::SeqCst))
+            .sum();
+        assert_eq!(
+            total, 3,
+            "O(wakes): expected 3 wakes for 3 recruit events with 5 parked waiters, got {}",
+            total
+        );
+        assert_eq!(
+            pool.info().tasks_len,
+            2,
+            "2 un-recruited entries must remain in tasks"
+        );
+        Ok(())
+    }
+
+    /// State-change (return_conn / release_conn) wake-all must still wake ALL
+    /// live parked waiters, not just one.
+    #[tokio::test]
+    async fn test_state_change_wakes_all_live_waiters() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(2));
+
+        let (_wakes_a, waker_a) = count_waker();
+        let (wakes_b, waker_b) = count_waker();
+        let mut cx_a = Context::from_waker(&waker_a);
+        let mut cx_b = Context::from_waker(&waker_b);
+
+        reserve_conn(&pool);
+        assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        reserve_conn(&pool);
+        assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+
+        let mut w_a = Box::pin(pool.get_handle());
+        let mut w_b = Box::pin(pool.get_handle());
+        // First waiter drives; drop it so only non-drivers remain parked.
+        assert!(matches!(w_a.as_mut().poll(&mut cx_a), Poll::Pending));
+        drop(w_a);
+        assert!(matches!(w_b.as_mut().poll(&mut cx_b), Poll::Pending));
+
+        // Place a second live waiter manually so we have two non-driver live entries.
+        let (wakes_c, waker_c) = count_waker();
+        pool.inner.tasks.push((TaskSlot::live(), waker_c.clone()));
+
+        // Trigger a state change (wake-all).
+        pool.inner.wake_tasks();
+
+        // Both live waiters must be woken.
+        assert_eq!(
+            wakes_b.load(Ordering::SeqCst),
+            1,
+            "live waiter b must be woken by state-change wake_tasks"
+        );
+        assert_eq!(
+            wakes_c.load(Ordering::SeqCst),
+            1,
+            "live waiter c must be woken by state-change wake_tasks"
+        );
+        assert_eq!(pool.info().tasks_len, 0, "all entries must be drained");
+
+        drop(w_b);
+        while pool.inner.new.pop().is_some() {
+            pool.inner.release_conn_slot();
+        }
         Ok(())
     }
 }
