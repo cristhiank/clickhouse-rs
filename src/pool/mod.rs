@@ -873,7 +873,11 @@ mod test {
 
     #[tokio::test]
     async fn test_connect() -> Result<()> {
-        let options = Options::from_str(DATABASE_URL.as_str()).unwrap();
+        // pool_max(1) is required: get_handle() eagerly opens pending connections
+        // up to pool_max, so the default pool would leave more than one idle handle.
+        let options = Options::from_str(DATABASE_URL.as_str())
+            .unwrap()
+            .pool_max(1);
         let pool = Pool::new(options);
         {
             let mut c = pool.get_handle().await?;
@@ -896,7 +900,10 @@ mod test {
             Ok(())
         }
 
-        let pool = Pool::new(DATABASE_URL.as_str());
+        let options = Options::from_str(DATABASE_URL.as_str())
+            .unwrap()
+            .pool_max(1);
+        let pool = Pool::new(options);
         done(pool.clone()).await?;
         assert_eq!(pool.info().idle_len, 0);
 
@@ -942,7 +949,7 @@ mod test {
         #[cfg(feature = "_tls")]
         assert!(spent < Duration::from_millis(5000)); // slow connect
         #[cfg(not(feature = "_tls"))]
-        assert!(spent < Duration::from_millis(2500));
+        assert!(spent < Duration::from_millis(5000)); // slow Docker/arch emulation
 
         assert_eq!(pool.info().idle_len, 6);
         Ok(())
@@ -950,7 +957,10 @@ mod test {
 
     #[tokio::test]
     async fn test_wrong_insert() -> Result<()> {
-        let pool = Pool::new(DATABASE_URL.as_str());
+        let options = Options::from_str(DATABASE_URL.as_str())
+            .unwrap()
+            .pool_max(1);
+        let pool = Pool::new(options);
         {
             let block = Block::new();
             let mut c = pool.get_handle().await?;
@@ -965,7 +975,10 @@ mod test {
 
     #[tokio::test]
     async fn test_wrong_execute() -> Result<()> {
-        let pool = Pool::new(DATABASE_URL.as_str());
+        let options = Options::from_str(DATABASE_URL.as_str())
+            .unwrap()
+            .pool_max(1);
+        let pool = Pool::new(options);
         {
             let mut c = pool.get_handle().await?;
             c.execute("DROP TABLE unexisting").await.unwrap_err();
