@@ -26,7 +26,14 @@ use url::Url;
 
 mod futures;
 
+// Per-poll work budget for existing connection-open futures.
 const PENDING_OPEN_POLL_BUDGET: usize = 4;
+// Cold-start backpressure cap for queued/in-flight connection opens.
+const PENDING_OPEN_LIMIT: usize = 4;
+
+fn pending_open_limit(max: usize) -> usize {
+    max.min(PENDING_OPEN_LIMIT)
+}
 
 pub(crate) struct Inner {
     new: crossbeam::queue::ArrayQueue<BoxFuture<'static, Result<ClientHandle>>>,
@@ -34,6 +41,8 @@ pub(crate) struct Inner {
     tasks: crossbeam::queue::SegQueue<Waker>,
     ongoing: atomic::AtomicUsize,
     conn_slots: atomic::AtomicUsize,
+    // Counts queued opens plus opens temporarily popped for polling.
+    pending_opens: atomic::AtomicUsize,
     hosts: Vec<Url>,
     connections_num: atomic::AtomicUsize,
 }
@@ -53,11 +62,33 @@ impl Inner {
         self.conn_slots.load(Ordering::Acquire)
     }
 
+    fn pending_open_count(&self) -> usize {
+        self.pending_opens.load(Ordering::Acquire)
+    }
+
     fn try_reserve_conn(&self, max: usize) -> bool {
         let mut current = self.conn_count();
 
         while current < max {
             match self.conn_slots.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+
+        false
+    }
+
+    fn try_reserve_pending_open(&self, max: usize) -> bool {
+        let mut current = self.pending_open_count();
+
+        while current < max {
+            match self.pending_opens.compare_exchange_weak(
                 current,
                 current + 1,
                 Ordering::AcqRel,
@@ -80,6 +111,18 @@ impl Inner {
             .is_err()
         {
             warn!("release_conn_slot called when no connections are reserved");
+        }
+    }
+
+    fn release_pending_open(&self) {
+        if self
+            .pending_opens
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_err()
+        {
+            warn!("release_pending_open called when no connection opens are pending");
         }
     }
 
@@ -203,11 +246,12 @@ impl Pool {
         }
 
         let inner = Arc::new(Inner {
-            new: crossbeam::queue::ArrayQueue::new(max),
+            new: crossbeam::queue::ArrayQueue::new(pending_open_limit(max).max(1)),
             idle: crossbeam::queue::ArrayQueue::new(max),
             tasks: crossbeam::queue::SegQueue::new(),
             ongoing: atomic::AtomicUsize::new(0),
             conn_slots: atomic::AtomicUsize::new(0),
+            pending_opens: atomic::AtomicUsize::new(0),
             connections_num: atomic::AtomicUsize::new(0),
             hosts,
         });
@@ -234,6 +278,10 @@ impl Pool {
         GetHandle::new(self)
     }
 
+    fn pending_open_limit(&self) -> usize {
+        pending_open_limit(self.max)
+    }
+
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<ClientHandle>> {
         let handle_futures_result = self.handle_futures(cx);
         let pool_info = if handle_futures_result.is_err() {
@@ -256,12 +304,22 @@ impl Pool {
         handle_futures_result?;
 
         if self.inner.try_reserve_conn(self.max) {
-            match self.inner.new.push(self.new_connection()) {
-                Ok(()) => {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
+            if self
+                .inner
+                .try_reserve_pending_open(self.pending_open_limit())
+            {
+                match self.inner.new.push(self.new_connection()) {
+                    Ok(()) => {
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    Err(_) => {
+                        self.inner.release_pending_open();
+                        self.inner.release_conn_slot();
+                    }
                 }
-                Err(_) => self.inner.release_conn_slot(),
+            } else {
+                self.inner.release_conn_slot();
             }
         }
 
@@ -357,8 +415,11 @@ impl Pool {
                 break;
             };
 
+            // The pending-open reservation moves with this future while it is polled.
+            // Terminal paths release it; pending futures keep it when requeued.
             match new.poll_unpin(cx) {
                 Poll::Ready(Ok(client)) => {
+                    self.inner.release_pending_open();
                     if self.inner.idle.push(client).is_err() {
                         self.inner.release_conn_slot();
                         warn!(
@@ -370,11 +431,13 @@ impl Pool {
                 }
                 Poll::Pending => {
                     if self.inner.new.push(new).is_err() {
+                        self.inner.release_pending_open();
                         self.inner.release_conn_slot();
                         wake_waiters = true;
                     }
                 }
                 Poll::Ready(Err(err)) => {
+                    self.inner.release_pending_open();
                     self.inner.release_conn_slot();
                     wake_waiters = true;
                     if first_err.is_none() {
@@ -561,6 +624,21 @@ mod test {
         assert!(pool.inner.try_reserve_conn(pool.max));
     }
 
+    fn reserve_pending_open(pool: &Pool) {
+        reserve_conn(pool);
+        assert!(pool
+            .inner
+            .try_reserve_pending_open(pool.pending_open_limit()));
+    }
+
+    fn replace_pending_open_with(
+        pool: &Pool,
+        new: futures_util::future::BoxFuture<'static, Result<ClientHandle>>,
+    ) {
+        assert!(pool.inner.new.pop().is_some());
+        assert!(pool.inner.new.push(new).is_ok());
+    }
+
     fn count_waker() -> (Arc<AtomicUsize>, Waker) {
         let wakes = Arc::new(AtomicUsize::new(0));
         (wakes.clone(), Waker::from(Arc::new(CountWake { wakes })))
@@ -685,7 +763,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_get_handle_starts_pending_connections_up_to_pool_max() -> Result<()> {
+    async fn test_get_handle_limits_pending_connections_during_cold_burst() -> Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move {
@@ -695,7 +773,7 @@ mod test {
             }
         });
 
-        let pool_max = 4;
+        let pool_max = 16;
         let options = Options::from_str(&format!("tcp://{}", addr))
             .unwrap()
             .pool_min(0)
@@ -711,7 +789,11 @@ mod test {
                     let _ = handle.as_mut().poll(cx);
                 }
 
-                if pool.info().new_len == pool_max {
+                let pending_limit = pool.pending_open_limit();
+                if pool.info().new_len == pending_limit
+                    && pool.inner.pending_open_count() == pending_limit
+                    && pool.inner.conn_count() == pending_limit
+                {
                     Poll::Ready(())
                 } else {
                     cx.waker().wake_by_ref();
@@ -722,7 +804,11 @@ mod test {
         .await
         .unwrap();
 
-        assert_eq!(pool.info().new_len, pool_max);
+        let pending_limit = pool.pending_open_limit();
+        assert_eq!(pool.info().new_len, pending_limit);
+        assert_eq!(pool.inner.pending_open_count(), pending_limit);
+        assert_eq!(pool.inner.conn_count(), pending_limit);
+        assert!(pending_limit < pool_max);
         accept.abort();
         Ok(())
     }
@@ -732,9 +818,10 @@ mod test {
         let pool_max = 16;
         let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
         let polls = Arc::new(AtomicUsize::new(0));
+        let pending_limit = pool.pending_open_limit();
 
-        for _ in 0..pool_max {
-            reserve_conn(&pool);
+        for _ in 0..pending_limit {
+            reserve_pending_open(&pool);
             assert!(pool
                 .inner
                 .new
@@ -753,7 +840,8 @@ mod test {
         }
 
         let poll_count = polls.load(Ordering::SeqCst);
-        assert_eq!(pool.info().new_len, pool_max);
+        assert_eq!(pool.info().new_len, pending_limit);
+        assert_eq!(pool.inner.pending_open_count(), pending_limit);
         assert!(poll_count <= pool_max * super::PENDING_OPEN_POLL_BUDGET);
         assert!(poll_count < pool_max * pool_max);
         Ok(())
@@ -762,7 +850,7 @@ mod test {
     #[tokio::test]
     async fn test_completed_pending_open_wakes_parked_waiter() -> Result<()> {
         let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
-        reserve_conn(&pool);
+        reserve_pending_open(&pool);
         assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
 
         let wakes = Arc::new(AtomicUsize::new(0));
@@ -776,13 +864,8 @@ mod test {
         assert_eq!(pool.info().tasks_len, 1);
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
 
-        let _ = pool.inner.new.pop();
         let client = synthetic_idle_client(&pool).await;
-        assert!(pool
-            .inner
-            .new
-            .push(Box::pin(future::ready(Ok(client))))
-            .is_ok());
+        replace_pending_open_with(&pool, Box::pin(future::ready(Ok(client))));
 
         let mut driver = pool.clone();
         driver.handle_futures(&mut cx)?;
@@ -796,13 +879,14 @@ mod test {
         drop(handle);
         assert_eq!(pool.info().ongoing, 0);
         assert_eq!(pool.inner.conn_count(), 0);
+        assert_eq!(pool.inner.pending_open_count(), 0);
         Ok(())
     }
 
     #[tokio::test]
     async fn test_pending_failure_wakes_live_waiter_after_stale_waiter() -> Result<()> {
         let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
-        reserve_conn(&pool);
+        reserve_pending_open(&pool);
         assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
 
         let (stale_wakes, stale_waker) = count_waker();
@@ -823,14 +907,10 @@ mod test {
         ));
         assert_eq!(pool.info().tasks_len, 2);
 
-        assert!(pool.inner.new.pop().is_some());
-        assert!(pool
-            .inner
-            .new
-            .push(Box::pin(future::ready(Err(Error::Driver(
-                DriverError::Timeout,
-            )))))
-            .is_ok());
+        replace_pending_open_with(
+            &pool,
+            Box::pin(future::ready(Err(Error::Driver(DriverError::Timeout)))),
+        );
 
         let mut driver = pool.clone();
         assert!(driver.handle_futures(&mut live_cx).is_err());
@@ -839,6 +919,7 @@ mod test {
         assert_eq!(live_wakes.load(Ordering::SeqCst), 1);
         assert_eq!(pool.info().tasks_len, 0);
         assert_eq!(pool.inner.conn_count(), 0);
+        assert_eq!(pool.inner.pending_open_count(), 0);
         drop(live_waiter);
         Ok(())
     }
@@ -848,7 +929,7 @@ mod test {
         let pool_max = 2;
         let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
         for _ in 0..pool_max {
-            reserve_conn(&pool);
+            reserve_pending_open(&pool);
             assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
         }
 
@@ -866,16 +947,10 @@ mod test {
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
 
         for _ in 0..pool_max {
-            assert!(pool.inner.new.pop().is_some());
-        }
-        for _ in 0..pool_max {
-            assert!(pool
-                .inner
-                .new
-                .push(Box::pin(future::ready(Err(Error::Driver(
-                    DriverError::Timeout,
-                )))))
-                .is_ok());
+            replace_pending_open_with(
+                &pool,
+                Box::pin(future::ready(Err(Error::Driver(DriverError::Timeout)))),
+            );
         }
 
         let mut driver = pool.clone();
@@ -885,6 +960,7 @@ mod test {
         assert_eq!(pool.info().tasks_len, 0);
         assert_eq!(pool.info().new_len, 0);
         assert_eq!(pool.inner.conn_count(), 0);
+        assert_eq!(pool.inner.pending_open_count(), 0);
         Ok(())
     }
 
@@ -918,7 +994,7 @@ mod test {
             .idle
             .push(synthetic_idle_client(&pool).await)
             .unwrap();
-        reserve_conn(&pool);
+        reserve_pending_open(&pool);
         assert!(pool
             .inner
             .new
@@ -937,6 +1013,7 @@ mod test {
         drop(handle);
         assert_eq!(pool.info().ongoing, 0);
         assert_eq!(pool.inner.conn_count(), 0);
+        assert_eq!(pool.inner.pending_open_count(), 0);
         Ok(())
     }
 
@@ -954,6 +1031,9 @@ mod test {
         }
 
         pool.inner.conn_slots.fetch_add(1, Ordering::AcqRel);
+        assert!(pool
+            .inner
+            .try_reserve_pending_open(pool.pending_open_limit()));
         let client = synthetic_idle_client(&pool).await;
         assert!(pool
             .inner
@@ -975,6 +1055,7 @@ mod test {
         assert_eq!(info.tasks_len, 0);
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
         assert_eq!(pool.inner.conn_count(), pool_max);
+        assert_eq!(pool.inner.pending_open_count(), 0);
         Ok(())
     }
 }
