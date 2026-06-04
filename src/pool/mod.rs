@@ -194,6 +194,7 @@ pub struct Pool {
 
 #[derive(Debug)]
 pub struct PoolInfo {
+    /// Number of queued connection-open futures, excluding opens currently being polled.
     pub new_len: usize,
     pub idle_len: usize,
     pub tasks_len: usize,
@@ -207,6 +208,8 @@ impl fmt::Debug for Pool {
             .field("min", &self.min)
             .field("max", &self.max)
             .field("new connections count", &info.new_len)
+            .field("pending open connections count", &self.pending_open_count())
+            .field("pending open connections limit", &self.pending_open_limit())
             .field("idle connections count", &info.idle_len)
             .field("tasks count", &info.tasks_len)
             .field("ongoing connections count", &info.ongoing)
@@ -278,7 +281,13 @@ impl Pool {
         GetHandle::new(self)
     }
 
-    fn pending_open_limit(&self) -> usize {
+    /// Number of queued or in-flight connection-open futures.
+    pub fn pending_open_count(&self) -> usize {
+        self.inner.pending_open_count()
+    }
+
+    /// Maximum queued or in-flight connection opens allowed by this pool.
+    pub fn pending_open_limit(&self) -> usize {
         pending_open_limit(self.max)
     }
 
@@ -324,6 +333,12 @@ impl Pool {
         }
 
         self.inner.tasks.push(cx.waker().clone());
+        if self.inner.idle.len() > 0
+            || (self.inner.conn_count() < self.max
+                && self.inner.pending_open_count() < self.pending_open_limit())
+        {
+            cx.waker().wake_by_ref();
+        }
         Poll::Pending
     }
 
@@ -553,9 +568,9 @@ mod test {
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
-        task::{Context, Poll, Wake, Waker},
+        task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
         time::{Duration, Instant},
     };
 
@@ -597,6 +612,78 @@ mod test {
             self.polls.fetch_add(1, Ordering::SeqCst);
             Poll::Pending
         }
+    }
+
+    struct ObserveInfoPending {
+        pool: Pool,
+        observed: Arc<Mutex<Option<(usize, usize, usize)>>>,
+    }
+
+    impl Future for ObserveInfoPending {
+        type Output = Result<ClientHandle>;
+
+        fn poll(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            *self.observed.lock().unwrap() = Some((
+                self.pool.info().new_len,
+                self.pool.pending_open_count(),
+                self.pool.pending_open_limit(),
+            ));
+            Poll::Pending
+        }
+    }
+
+    struct CloneHookWaker {
+        wakes: Arc<AtomicUsize>,
+        hook: Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    }
+
+    fn clone_hook_waker<F>(hook: F) -> (Arc<AtomicUsize>, Waker)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(CloneHookWaker {
+            wakes: wakes.clone(),
+            hook: Mutex::new(Some(Box::new(hook))),
+        });
+        let waker = unsafe { Waker::from_raw(clone_hook_raw_waker(state)) };
+        (wakes, waker)
+    }
+
+    fn clone_hook_raw_waker(state: Arc<CloneHookWaker>) -> RawWaker {
+        RawWaker::new(Arc::into_raw(state) as *const (), &CLONE_HOOK_WAKER_VTABLE)
+    }
+
+    static CLONE_HOOK_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_hook_clone,
+        clone_hook_wake,
+        clone_hook_wake_by_ref,
+        clone_hook_drop,
+    );
+
+    unsafe fn clone_hook_clone(data: *const ()) -> RawWaker {
+        let state =
+            std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(data as *const CloneHookWaker) });
+        let cloned = Arc::clone(&*state);
+        if let Some(hook) = state.hook.lock().unwrap().take() {
+            hook();
+        }
+        clone_hook_raw_waker(cloned)
+    }
+
+    unsafe fn clone_hook_wake(data: *const ()) {
+        let state = unsafe { Arc::from_raw(data as *const CloneHookWaker) };
+        state.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe fn clone_hook_wake_by_ref(data: *const ()) {
+        let state =
+            std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(data as *const CloneHookWaker) });
+        state.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe fn clone_hook_drop(data: *const ()) {
+        drop(unsafe { Arc::from_raw(data as *const CloneHookWaker) });
     }
 
     async fn synthetic_idle_client(pool: &Pool) -> ClientHandle {
@@ -844,6 +931,94 @@ mod test {
         assert_eq!(pool.inner.pending_open_count(), pending_limit);
         assert!(poll_count <= pool_max * super::PENDING_OPEN_POLL_BUDGET);
         assert!(poll_count < pool_max * pool_max);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_open_capacity_race_self_wakes_after_registration() -> Result<()> {
+        let pool_max = 16;
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(pool_max));
+        let pending_limit = pool.pending_open_limit();
+
+        for _ in 0..pending_limit {
+            reserve_pending_open(&pool);
+            assert!(pool.inner.new.push(Box::pin(future::pending())).is_ok());
+        }
+
+        let hook_pool = pool.clone();
+        let (wakes, waker) = clone_hook_waker(move || {
+            assert!(hook_pool.inner.new.pop().is_some());
+            hook_pool.inner.release_pending_open();
+            hook_pool.inner.release_conn_slot();
+            hook_pool.inner.wake_tasks();
+        });
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = Box::pin(pool.get_handle());
+
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+
+        let info = pool.info();
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(info.tasks_len, 1);
+        assert_eq!(info.new_len, pending_limit - 1);
+        assert_eq!(pool.pending_open_count(), pending_limit - 1);
+        assert!(pool.pending_open_count() < pool.pending_open_limit());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_max_capacity_race_self_wakes_after_registration() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
+        reserve_conn(&pool);
+
+        let hook_pool = pool.clone();
+        let (wakes, waker) = clone_hook_waker(move || {
+            hook_pool.inner.release_conn_slot();
+            hook_pool.inner.wake_tasks();
+        });
+        let mut cx = Context::from_waker(&waker);
+        let mut waiter = Box::pin(pool.get_handle());
+
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+
+        let info = pool.info();
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(info.tasks_len, 1);
+        assert_eq!(pool.inner.conn_count(), 0);
+        assert_eq!(pool.pending_open_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pool_diagnostics_report_in_flight_pending_opens_and_limit() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(16));
+        let pending_limit = pool.pending_open_limit();
+        let observed = Arc::new(Mutex::new(None));
+        reserve_pending_open(&pool);
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(ObserveInfoPending {
+                pool: pool.clone(),
+                observed: observed.clone(),
+            }))
+            .is_ok());
+
+        let (_, waker) = count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut driver = pool.clone();
+        driver.handle_futures(&mut cx)?;
+
+        assert_eq!(*observed.lock().unwrap(), Some((0, 1, pending_limit)));
+
+        let info = pool.info();
+        assert_eq!(info.new_len, 1);
+        assert_eq!(pool.pending_open_count(), 1);
+        assert_eq!(pool.pending_open_limit(), pending_limit);
+
+        let debug = format!("{:?}", pool);
+        assert!(debug.contains("pending open connections count"));
+        assert!(debug.contains("pending open connections limit"));
         Ok(())
     }
 
